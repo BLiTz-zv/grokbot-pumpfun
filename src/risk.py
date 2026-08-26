@@ -22,6 +22,8 @@ import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
+from pydantic import BaseModel
+
 from .models import Config, Position, RiskConfig, TradeDecision
 from .state import PipelineState, StateStore, describe
 
@@ -205,29 +207,96 @@ class RiskManager:
 
 
 # --------------------------------------------------------------------------
-# Стоп-лосс
+# Выходы из позиции
 # --------------------------------------------------------------------------
+
+# Порядок правил — это порядок приоритета. Сначала спасаем деньги, потом
+# забираем прибыль, потом бережём прибыль, и только потом закрываем по
+# времени: позиция, которая едет вверх, не должна закрыться по таймеру.
+EXIT_REASONS = ("stop_loss", "take_profit", "trailing_stop", "max_hold")
+
+
+class ExitSignal(BaseModel):
+    """Причина закрыть позицию и то, чем она обоснована."""
+
+    reason: str
+    detail: str = ""
+
+
+def pnl_pct(position: Position, price: float) -> float:
+    if position.entry_price <= 0:
+        return 0.0
+    return (price - position.entry_price) / position.entry_price * 100.0
 
 
 def stop_loss_triggered(position: Position, price: float, stop_loss_pct: float) -> bool:
-    if position.entry_price <= 0 or price <= 0:
+    if position.entry_price <= 0 or price <= 0 or stop_loss_pct <= 0:
         return False
-    drawdown = (position.entry_price - price) / position.entry_price * 100.0
-    return drawdown >= stop_loss_pct
+    return -pnl_pct(position, price) >= stop_loss_pct
 
 
-class StopLossWatcher:
+def exit_signal(
+    position: Position,
+    price: float,
+    risk: RiskConfig,
+    now: float | None = None,
+) -> ExitSignal | None:
+    """Пора ли выходить и почему. None — держим дальше.
+
+    Стоп-лосс здесь только одно из четырёх правил. Без остальных позиция,
+    выросшая втрое, не имеет ни одного способа закрыться в плюс — она
+    просто ждёт, пока откатится обратно к стопу.
+    """
+    if price <= 0 or position.entry_price <= 0:
+        return None
+
+    change = pnl_pct(position, price)
+
+    if risk.stop_loss_pct and -change >= risk.stop_loss_pct:
+        return ExitSignal(reason="stop_loss", detail=f"{change:+.1f}% от входа")
+
+    if risk.take_profit_pct and change >= risk.take_profit_pct:
+        return ExitSignal(reason="take_profit", detail=f"{change:+.1f}% от входа")
+
+    # Трейлинг работает только выше входа: ниже за позицию отвечает стоп-лосс,
+    # иначе два правила спорили бы за одну и ту же просадку.
+    peak = max(position.peak_price, price)
+    if risk.trailing_stop_pct and peak > position.entry_price:
+        drawdown = (peak - price) / peak * 100.0
+        if drawdown >= risk.trailing_stop_pct:
+            return ExitSignal(
+                reason="trailing_stop",
+                detail=f"откат {drawdown:.1f}% от пика {pnl_pct(position, peak):+.1f}%",
+            )
+
+    if risk.max_hold_seconds and position.opened_at:
+        held = (now or time.time()) - position.opened_at
+        if held >= risk.max_hold_seconds:
+            return ExitSignal(
+                reason="max_hold",
+                detail=f"{held / 60:.0f} мин в позиции, {change:+.1f}%",
+            )
+
+    return None
+
+
+class PositionWatcher:
     """Фоновая задача: опрашивает цены открытых позиций и зовёт продажу.
 
     Цена и продажа приходят снаружи колбэками — сюда не тянется ни RPC, ни
     executor, поэтому это тестируется без сети.
     """
 
+    # Насколько должен подрасти пик, чтобы записать его на диск. Каждый
+    # тик писать состояние незачем, а потерять пик при рестарте — значит
+    # заново начать трейлинг от текущей цены.
+    PEAK_PERSIST_STEP = 1.01
+
     def __init__(
         self,
         manager: RiskManager,
         price_fn: Callable[[str], Awaitable[float]],
-        sell_fn: Callable[[Position, float], Awaitable[None]],
+        sell_fn: Callable[[Position, float, str], Awaitable[None]],
     ) -> None:
         self.manager = manager
         self.price_fn = price_fn
@@ -237,17 +306,36 @@ class StopLossWatcher:
     async def check_once(self) -> list[str]:
         """Один проход по открытым позициям. Возвращает закрытые минты."""
         triggered: list[str] = []
+        persist_needed = False
+
         for position in list(self.manager.positions.values()):
             try:
                 price = await self.price_fn(position.mint)
             except Exception as exc:
                 log.warning("цена для %s недоступна: %s", position.mint, exc)
                 continue
-            if stop_loss_triggered(position, price, self.manager.risk.stop_loss_pct):
-                log.info("стоп-лосс по %s: вход %.9f, сейчас %.9f",
-                         position.mint, position.entry_price, price)
-                await self.sell_fn(position, price)
-                triggered.append(position.mint)
+            if price <= 0:
+                continue
+
+            if price > position.peak_price:
+                persist_needed = persist_needed or (
+                    price >= position.peak_price * self.PEAK_PERSIST_STEP
+                )
+                position.peak_price = price
+
+            signal = exit_signal(position, price, self.manager.risk)
+            if signal is None:
+                continue
+
+            log.info("выход из %s по правилу %s (%s): вход %.12f, сейчас %.12f",
+                     position.mint[:8], signal.reason, signal.detail,
+                     position.entry_price, price)
+            await self.sell_fn(position, price, signal.reason)
+            triggered.append(position.mint)
+            persist_needed = False        # продажа сохранит состояние сама
+
+        if persist_needed:
+            self.manager.persist()
         return triggered
 
     async def run(self) -> None:
@@ -258,11 +346,11 @@ class StopLossWatcher:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log.exception("стоп-лосс упал на проходе: %s", exc)
+                log.exception("присмотр за позициями упал на проходе: %s", exc)
             await asyncio.sleep(interval)
 
     def start(self) -> asyncio.Task:
-        self._task = asyncio.create_task(self.run(), name="stop-loss-watcher")
+        self._task = asyncio.create_task(self.run(), name="position-watcher")
         return self._task
 
     async def stop(self) -> None:

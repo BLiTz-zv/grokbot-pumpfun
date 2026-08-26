@@ -46,7 +46,7 @@ from .ops import (
     drain,
     install_signal_handlers,
 )
-from .risk import RiskManager, StopLossWatcher
+from .risk import PositionWatcher, RiskManager
 from .scoring import compute_scores, passes_threshold, weakest_component
 from .state import StateStore
 
@@ -83,7 +83,7 @@ class Pipeline:
         self.analyzer = Analyzer(config)
         self.executor: BaseExecutor = build_executor(config)
         self.monitor = LaunchMonitor(config, on_skip=self._log_monitor_skip)
-        self.watcher = StopLossWatcher(self.risk, self._price, self._sell)
+        self.watcher = PositionWatcher(self.risk, self._price, self._sell)
         self.health = HealthServer(
             config.ops.health_host, config.ops.health_port, self.status, self.metrics
         )
@@ -325,8 +325,8 @@ class Pipeline:
     async def _price(self, mint: str) -> float:
         return await self.executor.price(mint)
 
-    async def _sell(self, position: Position, price: float) -> None:
-        """Продажа по стоп-лоссу: закрыть, посчитать PnL, записать в лог."""
+    async def _sell(self, position: Position, price: float, reason: str = "stop_loss") -> None:
+        """Выход из позиции: продать, посчитать PnL, записать в лог."""
         try:
             result = await self.executor.sell(position)
         except NotImplementedError as exc:
@@ -339,10 +339,11 @@ class Pipeline:
         self._sync_counters()
         self.risk.register_close(position.mint, pnl_sol=pnl)
         self.trade_log.close(position, exit_price=result.price or price,
-                             pnl_sol=pnl, reason="stop_loss", tx_hash=result.tx_hash)
+                             pnl_sol=pnl, reason=reason, tx_hash=result.tx_hash)
         self.metrics.inc("closes")
+        self.metrics.inc(f"exit_{reason}")
         self.metrics.gauge("open_positions", self.risk.open_count)
-        log.info("ЗАКРЫТО %s по стоп-лоссу, PnL %+.4f SOL", position.mint[:8], pnl)
+        log.info("ЗАКРЫТО %s по правилу %s, PnL %+.4f SOL", position.mint[:8], reason, pnl)
 
 
 # --------------------------------------------------------------------------

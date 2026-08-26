@@ -246,6 +246,7 @@ class Position(BaseModel):
     mint: str
     symbol: str | None = None
     entry_price: float = 0.0
+    peak_price: float = 0.0          # максимум с момента входа, для трейлинга
     sol_spent: float = 0.0
     token_amount: float = 0.0
     opened_at: float = 0.0
@@ -320,6 +321,10 @@ class RiskConfig(BaseModel):
     max_open_positions: int = 3
     stop_loss_pct: float = 30.0
     stop_loss_poll_seconds: float = 15.0
+    # Выходы вверх и по времени. 0 в любом из них выключает правило.
+    take_profit_pct: float = 120.0
+    trailing_stop_pct: float = 35.0       # откат от пика, считается только выше входа
+    max_hold_seconds: float = 3600.0      # мемкоин, который час не поехал, не поедет
 
 
 class FilterConfig(BaseModel):
@@ -489,6 +494,18 @@ class Config(BaseModel):
             errors.append("risk.stop_loss_pct должен быть в интервале (0, 100)")
         if risk.stop_loss_poll_seconds <= 0:
             errors.append("risk.stop_loss_poll_seconds должен быть больше нуля")
+        if risk.take_profit_pct < 0:
+            errors.append("risk.take_profit_pct не может быть отрицательным")
+        if not 0 <= risk.trailing_stop_pct < 100:
+            errors.append("risk.trailing_stop_pct должен быть в интервале [0, 100)")
+        if risk.max_hold_seconds < 0:
+            errors.append("risk.max_hold_seconds не может быть отрицательным")
+        if risk.take_profit_pct and risk.take_profit_pct <= risk.stop_loss_pct:
+            warnings.append(
+                f"take_profit_pct ({risk.take_profit_pct}) не больше stop_loss_pct "
+                f"({risk.stop_loss_pct}) — на такой асимметрии выигрышная серия "
+                "не покроет проигрышную"
+            )
 
         flt = self.filter
         if not 0.0 <= flt.min_total_score <= 1.0:

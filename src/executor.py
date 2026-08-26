@@ -179,6 +179,7 @@ def new_position(token: Token, result: ExecutionResult, score: float) -> Positio
         mint=token.mint,
         symbol=token.symbol,
         entry_price=result.price,
+        peak_price=result.price,
         sol_spent=result.sol_amount,
         token_amount=result.token_amount,
         opened_at=time.time(),

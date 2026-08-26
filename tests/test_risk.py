@@ -6,8 +6,9 @@ import pytest
 from src.models import Config, Position, RiskConfig
 from src.risk import (
     MAX_SHARE_OF_REMAINING_BUDGET,
+    PositionWatcher,
     RiskManager,
-    StopLossWatcher,
+    exit_signal,
     stop_loss_triggered,
 )
 
@@ -43,8 +44,10 @@ def manager(config) -> RiskManager:
     return RiskManager(config, clock=FakeClock())
 
 
-def position(mint: str = "M", entry: float = 1.0, sol: float = 0.5) -> Position:
-    return Position(mint=mint, entry_price=entry, sol_spent=sol, opened_at=0.0)
+def position(mint: str = "M", entry: float = 1.0, sol: float = 0.5,
+             peak: float | None = None, opened_at: float = 0.0) -> Position:
+    return Position(mint=mint, entry_price=entry, sol_spent=sol, opened_at=opened_at,
+                    peak_price=entry if peak is None else peak)
 
 
 # --- размер позиции -------------------------------------------------------
@@ -194,18 +197,18 @@ async def test_watcher_sells_only_dumped_positions(manager):
     manager.register_open(position("DUMP", entry=1.0))
     manager.register_open(position("FINE", entry=1.0))
     prices = {"DUMP": 0.5, "FINE": 0.95}
-    sold: list[str] = []
+    sold: list[tuple[str, str]] = []
 
     async def price_fn(mint: str) -> float:
         return prices[mint]
 
-    async def sell_fn(pos, price) -> None:
-        sold.append(pos.mint)
+    async def sell_fn(pos, price, reason) -> None:
+        sold.append((pos.mint, reason))
         manager.register_close(pos.mint, pnl_sol=-0.25)
 
-    watcher = StopLossWatcher(manager, price_fn, sell_fn)
+    watcher = PositionWatcher(manager, price_fn, sell_fn)
     assert await watcher.check_once() == ["DUMP"]
-    assert sold == ["DUMP"]
+    assert sold == [("DUMP", "stop_loss")]
     assert "FINE" in manager.positions
 
 
@@ -215,9 +218,137 @@ async def test_watcher_survives_price_errors(manager):
     async def price_fn(mint: str) -> float:
         raise RuntimeError("RPC лёг")
 
-    async def sell_fn(pos, price) -> None:  # pragma: no cover - не должен вызваться
+    async def sell_fn(pos, price, reason) -> None:  # pragma: no cover - не должен вызваться
         raise AssertionError("продажа без цены")
 
-    watcher = StopLossWatcher(manager, price_fn, sell_fn)
+    watcher = PositionWatcher(manager, price_fn, sell_fn)
     assert await watcher.check_once() == []
     assert "A" in manager.positions
+
+
+# --- выходы вверх и по времени -------------------------------------------
+
+
+@pytest.fixture
+def exits(config) -> RiskConfig:
+    config.risk.stop_loss_pct = 30.0
+    config.risk.take_profit_pct = 120.0
+    config.risk.trailing_stop_pct = 35.0
+    config.risk.max_hold_seconds = 3600.0
+    return config.risk
+
+
+def test_holds_while_nothing_triggered(exits):
+    assert exit_signal(position(entry=1.0, opened_at=1000.0), 1.5, exits, now=1100.0) is None
+
+
+def test_take_profit_fires(exits):
+    signal = exit_signal(position(entry=1.0, opened_at=1000.0), 2.2, exits, now=1100.0)
+    assert signal is not None and signal.reason == "take_profit"
+    assert "+120" in signal.detail
+
+
+def test_take_profit_boundary(exits):
+    assert exit_signal(position(entry=1.0), 2.2, exits, now=1.0).reason == "take_profit"
+    assert exit_signal(position(entry=1.0), 2.19, exits, now=1.0) is None
+
+
+def test_stop_loss_wins_over_everything(exits):
+    """Просадка ниже стопа закрывает позицию, даже если она была в плюсе."""
+    signal = exit_signal(position(entry=1.0, peak=3.0, opened_at=0.0), 0.6, exits, now=1.0)
+    assert signal.reason == "stop_loss"
+
+
+def test_trailing_stop_fires_after_peak(exits):
+    pos = position(entry=1.0, peak=2.0, opened_at=1000.0)
+    assert exit_signal(pos, 1.4, exits, now=1100.0) is None          # откат 30%
+    signal = exit_signal(pos, 1.29, exits, now=1100.0)               # откат 35.5%
+    assert signal is not None and signal.reason == "trailing_stop"
+    assert "от пика" in signal.detail
+
+
+def test_trailing_ignores_price_below_entry(exits):
+    """Ниже входа за позицию отвечает стоп-лосс, а не трейлинг."""
+    signal = exit_signal(position(entry=1.0, peak=1.0, opened_at=1000.0), 0.8, exits, now=1100.0)
+    assert signal is None
+
+
+def test_trailing_uses_live_price_as_peak(exits):
+    """Пик обновляется прямо в проверке: рывок вверх и обратно не теряется."""
+    pos = position(entry=1.0, peak=1.0)
+    assert exit_signal(pos, 2.19, exits, now=1.0) is None            # ещё не take-profit
+    assert pos.peak_price == 1.0                                     # сама функция не пишет
+    pos.peak_price = 2.19
+    assert exit_signal(pos, 1.4, exits, now=1.0).reason == "trailing_stop"
+
+
+def test_max_hold_closes_stale_position(exits):
+    pos = position(entry=1.0, opened_at=1000.0)
+    assert exit_signal(pos, 1.05, exits, now=1000.0 + 3599) is None
+    signal = exit_signal(pos, 1.05, exits, now=1000.0 + 3601)
+    assert signal is not None and signal.reason == "max_hold"
+
+
+def test_max_hold_does_not_cut_a_runner(exits):
+    """Позиция, которая едет вверх, закроется по take-profit, а не по таймеру."""
+    pos = position(entry=1.0, peak=2.5, opened_at=1000.0)
+    signal = exit_signal(pos, 2.5, exits, now=1000.0 + 99_999)
+    assert signal.reason == "take_profit"
+
+
+def test_zero_disables_each_rule(exits):
+    exits.take_profit_pct = 0.0
+    exits.trailing_stop_pct = 0.0
+    exits.max_hold_seconds = 0.0
+    pos = position(entry=1.0, peak=5.0, opened_at=1.0)
+    assert exit_signal(pos, 4.0, exits, now=10**9) is None
+    assert exit_signal(pos, 0.5, exits, now=10**9).reason == "stop_loss"
+
+
+def test_no_signal_without_price(exits):
+    assert exit_signal(position(entry=1.0), 0.0, exits, now=1.0) is None
+    assert exit_signal(position(entry=0.0), 1.0, exits, now=1.0) is None
+
+
+async def test_watcher_tracks_peak_and_persists(config, tmp_path):
+    from src.state import StateStore
+
+    store = StateStore(tmp_path / "state.json")
+    manager = RiskManager(config, clock=FakeClock(), store=store)
+    manager.risk.take_profit_pct = 0.0
+    manager.risk.trailing_stop_pct = 0.0
+    manager.register_open(position("A", entry=1.0))
+
+    prices = iter([1.5, 2.0])
+
+    async def price_fn(mint: str) -> float:
+        return next(prices)
+
+    async def sell_fn(pos, price, reason) -> None:  # pragma: no cover
+        raise AssertionError("выхода быть не должно")
+
+    watcher = PositionWatcher(manager, price_fn, sell_fn)
+    await watcher.check_once()
+    await watcher.check_once()
+
+    assert manager.positions["A"].peak_price == 2.0
+    saved = store.load()
+    assert saved.positions["A"].peak_price >= 1.5      # пик пережил бы рестарт
+
+
+async def test_watcher_reports_exit_reason(config):
+    manager = RiskManager(config, clock=FakeClock())
+    manager.risk.take_profit_pct = 50.0
+    manager.register_open(position("A", entry=1.0))
+    seen: list[str] = []
+
+    async def price_fn(mint: str) -> float:
+        return 1.6
+
+    async def sell_fn(pos, price, reason) -> None:
+        seen.append(reason)
+        manager.register_close(pos.mint, pnl_sol=0.3)
+
+    watcher = PositionWatcher(manager, price_fn, sell_fn)
+    assert await watcher.check_once() == ["A"]
+    assert seen == ["take_profit"]
