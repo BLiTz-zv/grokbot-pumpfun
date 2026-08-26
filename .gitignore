@@ -16,3 +16,4 @@ venv/
 
 # os
 .DS_Store
+state/

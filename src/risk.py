@@ -22,6 +22,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 
 from .models import Config, Position, RiskConfig, TradeDecision
+from .state import PipelineState, StateStore, describe
 
 log = logging.getLogger(__name__)
 
@@ -35,14 +36,64 @@ MIN_TRADE_SOL = 0.01
 class RiskManager:
     """Состояние дня, открытые позиции и решение о размере."""
 
-    def __init__(self, config: Config, clock: Callable[[], float] = time.time) -> None:
+    def __init__(
+        self,
+        config: Config,
+        clock: Callable[[], float] = time.time,
+        store: StateStore | None = None,
+    ) -> None:
         self.config = config
         self.risk: RiskConfig = config.risk
         self.clock = clock
+        self.store = store
         self.day = self._today()
         self.trades_today = 0
         self.realized_pnl_sol = 0.0          # отрицательное = убыток
         self.positions: dict[str, Position] = {}
+        self.grok_calls_today = 0
+
+    # -- состояние на диске ------------------------------------------------
+
+    def restore(self) -> bool:
+        """Поднять состояние с диска. True, если что-то восстановлено.
+
+        Позиции восстанавливаются всегда: они реально открыты на цепочке,
+        сколько бы времени ни прошло. Счётчики дня — только если файл от
+        сегодняшних суток: чужой день своих лимитов нам не диктует.
+        """
+        if self.store is None:
+            return False
+        state = self.store.load()
+        if state is None:
+            return False
+
+        self.positions = dict(state.positions)
+        if state.day == self.day:
+            self.trades_today = state.trades_today
+            self.realized_pnl_sol = state.realized_pnl_sol
+            self.grok_calls_today = state.grok_calls_today
+        else:
+            log.info("состояние от %s, сегодня %s — счётчики дня начинаем заново",
+                     state.day or "?", self.day)
+        log.info("состояние восстановлено: %s", describe(state))
+        if self.halted:
+            log.warning("после восстановления дневной лимит убытка уже выбран — "
+                        "торговли сегодня не будет")
+        return True
+
+    def persist(self) -> None:
+        """Сохранить состояние. Вызывается после каждого изменения денег."""
+        if self.store is None:
+            return
+        self.store.save(
+            PipelineState(
+                day=self.day,
+                trades_today=self.trades_today,
+                realized_pnl_sol=self.realized_pnl_sol,
+                grok_calls_today=self.grok_calls_today,
+                positions=self.positions,
+            )
+        )
 
     # -- сутки -------------------------------------------------------------
 
@@ -58,6 +109,8 @@ class RiskManager:
             self.day = today
             self.trades_today = 0
             self.realized_pnl_sol = 0.0
+            self.grok_calls_today = 0
+            self.persist()
             return True
         return False
 
@@ -127,10 +180,12 @@ class RiskManager:
         self.roll_day_if_needed()
         self.positions[position.mint] = position
         self.trades_today += 1
+        self.persist()
 
     def register_close(self, mint: str, pnl_sol: float) -> Position | None:
         position = self.positions.pop(mint, None)
         self.realized_pnl_sol += pnl_sol
+        self.persist()
         if self.halted:
             log.warning("дневной лимит убытка выбран, торговля остановлена до %s",
                         "следующих суток UTC")
@@ -144,6 +199,7 @@ class RiskManager:
             "realized_pnl_sol": round(self.realized_pnl_sol, 6),
             "remaining_loss_budget": round(self.remaining_loss_budget, 6),
             "halted": self.halted,
+            "grok_calls_today": self.grok_calls_today,
         }
 
 
