@@ -2,16 +2,21 @@
 
 Здесь же живут модели конфига: конфиг читается один раз при старте и
 дальше ходит по пайплайну типизированным объектом, а не словарём.
+
+Секреты — SecretStr: они не попадут ни в логи, ни в traceback, ни в дамп
+состояния, даже если модель где-то напечатают целиком.
 """
 
 from __future__ import annotations
 
+import copy
+import os
 import time
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 
 # --------------------------------------------------------------------------
@@ -262,14 +267,24 @@ class TradeDecision(BaseModel):
 # --------------------------------------------------------------------------
 
 
-class GrokConfig(BaseModel):
-    api_key: str = ""
+class SecretModel(BaseModel):
+    """База для секций с секретами: присваивание строки коэрсится в SecretStr."""
+
+    model_config = ConfigDict(validate_assignment=True)
+
+
+class GrokConfig(SecretModel):
+    api_key: SecretStr = SecretStr("")
     base_url: str = "https://api.x.ai/v1/chat/completions"
     fast_model: str = "grok-4-fast"
     checker_model: str = "grok-4"
     timeout_seconds: float = 30.0
     max_retries: int = 3
     retry_base_delay: float = 1.0
+
+    @property
+    def key(self) -> str:
+        return self.api_key.get_secret_value()
 
 
 class JitoConfig(BaseModel):
@@ -278,17 +293,25 @@ class JitoConfig(BaseModel):
     tip_lamports: int = 1_000_000
 
 
-class SolanaConfig(BaseModel):
+class SolanaConfig(SecretModel):
     rpc_url: str = "https://api.mainnet-beta.solana.com"
-    wallet_private_key: str = ""
+    wallet_private_key: SecretStr = SecretStr("")
     jito: JitoConfig = Field(default_factory=JitoConfig)
 
+    @property
+    def wallet_key(self) -> str:
+        return self.wallet_private_key.get_secret_value()
 
-class DataConfig(BaseModel):
-    api_key: str = ""
+
+class DataConfig(SecretModel):
+    api_key: SecretStr = SecretStr("")
     rest_url: str = "https://frontend-api.pump.fun"
     ws_url: str = "wss://pumpportal.fun/api/data"
     request_timeout: float = 10.0
+
+    @property
+    def key(self) -> str:
+        return self.api_key.get_secret_value()
 
 
 class RiskConfig(BaseModel):
@@ -324,6 +347,76 @@ class ScoringConfig(BaseModel):
 class LoggingConfig(BaseModel):
     path: str = "logs/trades.jsonl"
     level: str = "INFO"
+    max_bytes: int = 50_000_000          # ротация JSONL, 0 — не ротировать
+    backups: int = 5
+
+
+class OpsConfig(BaseModel):
+    """Эксплуатационные настройки: то, что нужно процессу, живущему сутками."""
+
+    state_path: str = "state/pipeline.json"   # переживает рестарт
+    health_port: int = 0                      # 0 — health-эндпоинт выключен
+    health_host: str = "127.0.0.1"
+    heartbeat_seconds: float = 300.0          # строка живости в лог
+    shutdown_grace_seconds: float = 30.0      # сколько ждать токены в работе
+    max_grok_calls_per_day: int = 2000        # потолок расхода на агентов
+    grok_max_concurrency: int = 4
+    grok_calls_per_minute: int = 60
+    breaker_failures: int = 8                 # подряд, до размыкания
+    breaker_cooldown_seconds: float = 120.0
+
+
+# --------------------------------------------------------------------------
+# Конфиг целиком
+# --------------------------------------------------------------------------
+
+# Плейсхолдеры из config.example.yaml. Ловятся до старта, а не в проде.
+PLACEHOLDER_MARKERS = ("YOUR", "CHANGEME", "xxx", "<", "example")
+
+# Переменные окружения важнее файла: в контейнере секреты приходят так, а
+# не редактированием yaml внутри образа.
+ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
+    "GROKBOT_MODE": ("mode",),
+    "GROKBOT_GROK_API_KEY": ("grok", "api_key"),
+    "GROKBOT_DATA_API_KEY": ("data", "api_key"),
+    "GROKBOT_WALLET_PRIVATE_KEY": ("solana", "wallet_private_key"),
+    "GROKBOT_RPC_URL": ("solana", "rpc_url"),
+    "GROKBOT_LOG_PATH": ("logging", "path"),
+    "GROKBOT_LOG_LEVEL": ("logging", "level"),
+    "GROKBOT_STATE_PATH": ("ops", "state_path"),
+    "GROKBOT_HEALTH_PORT": ("ops", "health_port"),
+}
+
+
+class ConfigError(RuntimeError):
+    """Конфиг не годится для запуска. Список проблем — в аргументе."""
+
+
+def is_placeholder(value: str) -> bool:
+    """Значение из шаблона, а не настоящий секрет."""
+    if not value.strip():
+        return True
+    return any(marker.lower() in value.lower() for marker in PLACEHOLDER_MARKERS)
+
+
+def mask(secret: str) -> str:
+    """Как секрет выглядит в логах: хвост опознать можно, использовать нельзя."""
+    if not secret:
+        return "<пусто>"
+    if len(secret) <= 8:
+        return "***"
+    return f"{secret[:4]}…{secret[-4:]} ({len(secret)} симв.)"
+
+
+def _deep_set(target: dict[str, Any], path: tuple[str, ...], value: Any) -> None:
+    node = target
+    for key in path[:-1]:
+        child = node.get(key)
+        if not isinstance(child, dict):
+            child = {}
+            node[key] = child
+        node = child
+    node[path[-1]] = value
 
 
 class Config(BaseModel):
@@ -335,12 +428,138 @@ class Config(BaseModel):
     filter: FilterConfig = Field(default_factory=FilterConfig)
     scoring: ScoringConfig = Field(default_factory=ScoringConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    ops: OpsConfig = Field(default_factory=OpsConfig)
 
     @property
     def is_live(self) -> bool:
         return self.mode == "live"
 
+    # -- загрузка ----------------------------------------------------------
+
     @classmethod
-    def load(cls, path: str | Path = "config.yaml") -> Config:
+    def load(
+        cls,
+        path: str | Path = "config.yaml",
+        env: dict[str, str] | None = None,
+    ) -> Config:
+        """Прочитать yaml и наложить переменные окружения поверх."""
         raw: dict[str, Any] = yaml.safe_load(Path(path).read_text()) or {}
-        return cls.model_validate(raw)
+        return cls.from_raw(raw, env)
+
+    @classmethod
+    def from_raw(cls, raw: dict[str, Any], env: dict[str, str] | None = None) -> Config:
+        environ = os.environ if env is None else env
+        # Глубокая копия: наложение env не должно править словарь вызывающего.
+        merged = copy.deepcopy(raw)
+        for name, path in ENV_OVERRIDES.items():
+            value = environ.get(name)
+            if value is not None and value != "":
+                _deep_set(merged, path, value)
+        return cls.model_validate(merged)
+
+    # -- проверки перед стартом -------------------------------------------
+
+    def problems(self) -> tuple[list[str], list[str]]:
+        """(ошибки, предупреждения). Ошибка — не стартуем вообще."""
+        errors: list[str] = []
+        warnings: list[str] = []
+
+        if is_placeholder(self.grok.key):
+            errors.append(
+                "grok.api_key не задан (или остался плейсхолдером) — "
+                "без него не работает ни один агент, включая dry-run"
+            )
+        for name in ("fast_model", "checker_model"):
+            if not getattr(self.grok, name).strip():
+                errors.append(f"grok.{name} пустой")
+        if self.grok.timeout_seconds <= 0:
+            errors.append("grok.timeout_seconds должен быть больше нуля")
+        if self.grok.max_retries < 1:
+            errors.append("grok.max_retries должен быть не меньше 1")
+
+        risk = self.risk
+        if risk.max_sol_per_trade <= 0:
+            errors.append("risk.max_sol_per_trade должен быть больше нуля")
+        if risk.daily_loss_limit_sol <= 0:
+            errors.append("risk.daily_loss_limit_sol должен быть больше нуля")
+        if risk.max_trades_per_day < 1:
+            errors.append("risk.max_trades_per_day должен быть не меньше 1")
+        if risk.max_open_positions < 1:
+            errors.append("risk.max_open_positions должен быть не меньше 1")
+        if not 0 < risk.stop_loss_pct < 100:
+            errors.append("risk.stop_loss_pct должен быть в интервале (0, 100)")
+        if risk.stop_loss_poll_seconds <= 0:
+            errors.append("risk.stop_loss_poll_seconds должен быть больше нуля")
+
+        flt = self.filter
+        if not 0.0 <= flt.min_total_score <= 1.0:
+            errors.append("filter.min_total_score должен быть в интервале [0, 1]")
+        if not 0.0 < flt.max_curve_progress <= 1.0:
+            errors.append("filter.max_curve_progress должен быть в интервале (0, 1]")
+        if not 0.0 <= flt.max_risk_score <= 10.0:
+            errors.append("filter.max_risk_score должен быть в интервале [0, 10]")
+        if flt.min_age_seconds < 0:
+            errors.append("filter.min_age_seconds не может быть отрицательным")
+
+        weights = self.scoring.weights
+        if sum(max(0.0, w) for w in weights.model_dump().values()) <= 0:
+            errors.append("все веса scoring.weights нулевые или отрицательные")
+
+        if self.ops.max_grok_calls_per_day < 1:
+            errors.append("ops.max_grok_calls_per_day должен быть не меньше 1")
+        if self.ops.grok_max_concurrency < 1:
+            errors.append("ops.grok_max_concurrency должен быть не меньше 1")
+
+        if self.is_live:
+            if is_placeholder(self.solana.wallet_key):
+                errors.append("mode: live, но solana.wallet_private_key не задан")
+            if not self.solana.rpc_url.startswith("https://"):
+                errors.append("solana.rpc_url в live должен быть https")
+            if risk.max_sol_per_trade > 5.0:
+                warnings.append(
+                    f"risk.max_sol_per_trade = {risk.max_sol_per_trade} SOL — "
+                    "крупно для мемкоина на кривой, перепроверьте"
+                )
+
+        if is_placeholder(self.data.key):
+            warnings.append(
+                "data.api_key не задан — публичный эндпоинт отдаёт данные с "
+                "лимитами, на потоке будут пропуски"
+            )
+        if flt.min_total_score < 0.5:
+            warnings.append(
+                f"filter.min_total_score = {flt.min_total_score} — низкий порог, "
+                "до чекера дойдёт заметно больше токенов и вырастет расход"
+            )
+        return errors, warnings
+
+    def check_ready(self) -> list[str]:
+        """Бросить ConfigError, если стартовать нельзя. Вернуть предупреждения."""
+        errors, warnings = self.problems()
+        if errors:
+            raise ConfigError(
+                "конфиг не годится для запуска:\n  - " + "\n  - ".join(errors)
+            )
+        return warnings
+
+    # -- вывод -------------------------------------------------------------
+
+    def redacted(self) -> dict[str, Any]:
+        """Дамп конфига, безопасный для лога: секреты замаскированы."""
+        data = self.model_dump(mode="json")
+        data["grok"]["api_key"] = mask(self.grok.key)
+        data["data"]["api_key"] = mask(self.data.key)
+        data["solana"]["wallet_private_key"] = mask(self.solana.wallet_key)
+        return data
+
+    def summary(self) -> str:
+        """Одна строка для стартового лога."""
+        return (
+            f"mode={self.mode} "
+            f"grok={self.grok.fast_model}/{self.grok.checker_model} "
+            f"key={mask(self.grok.key)} "
+            f"risk={self.risk.max_sol_per_trade}SOL/сделка "
+            f"limit={self.risk.daily_loss_limit_sol}SOL/день "
+            f"score>={self.filter.min_total_score} "
+            f"state={self.ops.state_path}"
+        )

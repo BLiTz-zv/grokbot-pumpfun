@@ -39,8 +39,8 @@ class Analyzer:
     async def __aenter__(self) -> Analyzer:
         if self._client is None:
             headers = {"Accept": "application/json"}
-            if self.data.api_key:
-                headers["Authorization"] = f"Bearer {self.data.api_key}"
+            if self.data.key:
+                headers["Authorization"] = f"Bearer {self.data.key}"
             self._client = httpx.AsyncClient(
                 base_url=self.data.rest_url,
                 timeout=self.data.request_timeout,

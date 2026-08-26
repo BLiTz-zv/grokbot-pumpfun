@@ -124,7 +124,7 @@ class GrokAgent:
         """POST в Grok с ретраями. Возвращает текст ответа модели."""
         client = self._ensure_client()
         headers = {
-            "Authorization": f"Bearer {self.grok.api_key}",
+            "Authorization": f"Bearer {self.grok.key}",
             "Content-Type": "application/json",
         }
         last_error: Exception | None = None
