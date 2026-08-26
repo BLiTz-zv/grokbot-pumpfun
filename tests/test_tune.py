@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-import tune  # noqa: E402
+import tune
 
 
 def scores(audit=0.8, narrative=0.8, timing=0.8, metrics=0.8, total=0.8) -> dict:

@@ -25,12 +25,12 @@ import argparse
 import itertools
 import sys
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.log import TradeLog, read_log  # noqa: E402
-from src.models import Config  # noqa: E402
+from src.log import TradeLog, read_log
+from src.models import Config
 
 COMPONENTS = ("audit", "narrative", "timing", "metrics")
 THRESHOLDS = (0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85)

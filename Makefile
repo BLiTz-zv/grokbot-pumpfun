@@ -1,4 +1,4 @@
-.PHONY: help install dev test cov lint fmt types check run check-config dashboard replay docker clean
+.PHONY: help install dev test cov lint fmt types check run check-config dashboard replay tune docker clean
 
 PY ?= python3
 VENV ?= .venv
@@ -45,6 +45,9 @@ dashboard:       ## живой дашборд по логу
 
 replay:          ## сводка по логу
 	$(BIN)/python scripts/replay.py $(LOG) --rotated
+
+tune:            ## подобрать веса и порог по логу
+	$(BIN)/python scripts/tune.py $(LOG) --rotated
 
 docker:          ## собрать образ
 	docker build -t grokbot-pumpfun:latest .
