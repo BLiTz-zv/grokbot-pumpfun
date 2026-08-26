@@ -629,3 +629,47 @@ async def test_alerts_off_by_default(config):
     assert not pipeline.notifier.enabled
     await pipeline.process(fresh_token())          # ничего не шлётся и не падает
     assert pipeline.notifier.snapshot() == {"sent": 0, "dropped": 0, "failed": 0}
+
+
+# --- покупка без цены -----------------------------------------------------
+
+
+async def test_buy_without_price_is_refused(config):
+    """Позиция с нулевой ценой входа неуправляема: ни одно правило выхода
+    на ней не срабатывает, и она висела бы открытой вечно."""
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    CURVE["sol"] = 0                                # провайдер не отдал резервы
+    без_цены = fresh_token()
+    без_цены.market_cap_sol = 0.0                   # и запасной прикидки тоже нет
+
+    assert await pipeline.process(без_цены) is None
+    assert pipeline.risk.open_count == 0
+    records = list(read_log(config.logging.path))
+    assert records[-1]["stage"] == "executor"
+    assert records[-1]["reason"] == "execution_failed"
+
+
+async def test_blind_position_degrades_health(config):
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    await pipeline.process(fresh_token())
+
+    pipeline.watcher.price_failures["Mint1111"] = pipeline.watcher.BLIND_AFTER
+    status = pipeline.status()
+    assert status["blind_positions"] == 1
+    assert status["status"] == "degraded"
+
+
+async def test_blind_position_is_announced(config):
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    seen = wire_alerts(pipeline)
+    await pipeline.process(fresh_token())
+
+    pipeline.watcher.price_failures["Mint1111"] = pipeline.watcher.BLIND_AFTER
+    pipeline._check_transitions()
+    await flush_alerts(pipeline)
+    blind = [e for e in seen if e["event"] == "blind"]
+    assert len(blind) == 1
+    assert "не работают" in blind[0]["text"]

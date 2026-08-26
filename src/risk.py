@@ -292,6 +292,10 @@ class PositionWatcher:
     # заново начать трейлинг от текущей цены.
     PEAK_PERSIST_STEP = 1.01
 
+    # Столько проходов подряд без котировки — и позиция считается слепой:
+    # правила выхода по ней не работают, а молчать об этом нельзя.
+    BLIND_AFTER = 3
+
     def __init__(
         self,
         manager: RiskManager,
@@ -301,7 +305,14 @@ class PositionWatcher:
         self.manager = manager
         self.price_fn = price_fn
         self.sell_fn = sell_fn
+        self.price_failures: dict[str, int] = {}
         self._task: asyncio.Task | None = None
+
+    @property
+    def blind(self) -> list[str]:
+        """Позиции, по которым давно нет цены. Выходы по ним не работают."""
+        return [mint for mint, misses in self.price_failures.items()
+                if misses >= self.BLIND_AFTER and mint in self.manager.positions]
 
     async def check_once(self) -> list[str]:
         """Один проход по открытым позициям. Возвращает закрытые минты."""
@@ -313,9 +324,11 @@ class PositionWatcher:
                 price = await self.price_fn(position.mint)
             except Exception as exc:
                 log.warning("цена для %s недоступна: %s", position.mint, exc)
-                continue
+                price = 0.0
             if price <= 0:
+                self._miss(position.mint)
                 continue
+            self.price_failures.pop(position.mint, None)
 
             if price > position.peak_price:
                 persist_needed = persist_needed or (
@@ -337,6 +350,14 @@ class PositionWatcher:
         if persist_needed:
             self.manager.persist()
         return triggered
+
+    def _miss(self, mint: str) -> None:
+        """Учесть проход без котировки и сказать вслух, когда их слишком много."""
+        misses = self.price_failures.get(mint, 0) + 1
+        self.price_failures[mint] = misses
+        if misses == self.BLIND_AFTER:
+            log.error("позиция %s без цены %d проходов подряд — правила выхода "
+                      "по ней сейчас не работают", mint[:8], misses)
 
     async def run(self) -> None:
         interval = self.manager.risk.stop_loss_poll_seconds

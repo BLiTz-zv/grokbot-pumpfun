@@ -98,7 +98,9 @@ class Pipeline:
         self._stopping = asyncio.Event()
         self._started_at = time.time()
         self._last_event_at = time.time()
-        self._alerted: dict[str, bool] = {"breaker": False, "halted": False, "stalled": False}
+        self._alerted: dict[str, bool] = {
+            "breaker": False, "halted": False, "stalled": False, "blind": False,
+        }
 
     # -- жизненный цикл ----------------------------------------------------
 
@@ -351,6 +353,12 @@ class Pipeline:
                 "поток лончей встал: нет событий из сокета",
                 "поток лончей восстановился",
             ),
+            "blind": (
+                bool(status["blind_positions"]),
+                f"нет цен по {status['blind_positions']} открытым позициям — "
+                "стоп-лосс и take-profit по ним сейчас не работают",
+                "цены по позициям снова приходят",
+            ),
         }
         for name, (active, on_text, off_text) in edges.items():
             if active and not self._alerted[name]:
@@ -385,7 +393,8 @@ class Pipeline:
         """Снимок для /healthz и heartbeat. Ничего секретного не содержит."""
         stalled = (time.time() - self._last_event_at) > STALL_SECONDS
         breaker = self.grok_ops.breaker.state
-        state = "degraded" if breaker == "open" or stalled else "ok"
+        blind = bool(self.watcher.blind)
+        state = "degraded" if breaker == "open" or stalled or blind else "ok"
         return {
             "status": state,
             "mode": self.config.mode,
@@ -395,6 +404,7 @@ class Pipeline:
             "in_flight": len(self._tasks),
             "pending_launches": len(self.monitor.pending),
             "open_positions": self.risk.open_count,
+            "blind_positions": len(self.watcher.blind),
             "trades_today": self.risk.trades_today,
             "realized_pnl_sol": round(self.risk.realized_pnl_sol, 6),
             "halted": self.risk.halted,

@@ -360,7 +360,9 @@ class AlertsConfig(SecretModel):
     # В URL обычно зашит токен, поэтому это секрет, а не строка.
     webhook_url: SecretStr = SecretStr("")
     events: list[str] = Field(
-        default_factory=lambda: ["started", "buy", "close", "rug", "breaker", "halted"]
+        default_factory=lambda: [
+            "started", "buy", "close", "rug", "breaker", "halted", "blind"
+        ]
     )
     timeout_seconds: float = 10.0
     max_per_minute: int = 20
@@ -414,7 +416,7 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
 
 # События, которые пайплайн умеет отправлять в webhook.
 ALERT_EVENTS = frozenset(
-    {"started", "stopped", "buy", "close", "rug", "breaker", "halted", "stalled"}
+    {"started", "stopped", "buy", "close", "rug", "breaker", "halted", "stalled", "blind"}
 )
 
 

@@ -82,7 +82,7 @@ alerts:
   # URL обычно содержит токен, поэтому его лучше задавать через
   # переменную GROKBOT_ALERT_WEBHOOK, а не хранить в файле.
   webhook_url: ""
-  events: ["started", "buy", "close", "rug", "breaker", "halted"]
+  events: ["started", "buy", "close", "rug", "breaker", "halted", "blind"]
   timeout_seconds: 10
   max_per_minute: 20          # лишнее выбрасывается, а не копится в очереди
 

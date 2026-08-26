@@ -104,13 +104,19 @@ class DryRunExecutor(BaseExecutor):
         price = await self.price(token.mint)
         if price <= 0:
             price = token.market_cap_sol / TOTAL_SUPPLY if token.market_cap_sol else 0.0
-        amount = size_sol / price if price > 0 else 0.0
+        if price <= 0:
+            # Позиция с нулевой ценой входа неуправляема: ни одно правило
+            # выхода на ней не срабатывает, и она висит открытой вечно.
+            # Отказ от сделки — единственный правильный исход.
+            log.warning("покупка %s отменена: цена входа неизвестна", token.mint[:8])
+            return ExecutionResult(ok=False, error="цена входа неизвестна")
+
         log.info("[dry-run] покупка %s на %.4f SOL по %.12f", token.mint, size_sol, price)
         return ExecutionResult(
             ok=True,
             tx_hash=DRY_RUN_TX,
             price=price,
-            token_amount=amount,
+            token_amount=size_sol / price,
             sol_amount=size_sol,
         )
 

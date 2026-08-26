@@ -352,3 +352,72 @@ async def test_watcher_reports_exit_reason(config):
     watcher = PositionWatcher(manager, price_fn, sell_fn)
     assert await watcher.check_once() == ["A"]
     assert seen == ["take_profit"]
+
+
+# --- позиция без котировок ------------------------------------------------
+
+
+async def test_position_without_price_is_reported_blind(manager):
+    manager.register_open(position("A", entry=1.0))
+
+    async def price_fn(mint: str) -> float:
+        raise RuntimeError("провайдер лёг")
+
+    async def sell_fn(pos, price, reason) -> None:  # pragma: no cover
+        raise AssertionError("продажа без цены")
+
+    watcher = PositionWatcher(manager, price_fn, sell_fn)
+    for _ in range(watcher.BLIND_AFTER - 1):
+        await watcher.check_once()
+    assert watcher.blind == []                # ещё терпим
+
+    await watcher.check_once()
+    assert watcher.blind == ["A"]             # а вот теперь молчать нельзя
+
+
+async def test_zero_price_counts_as_missing(manager):
+    manager.register_open(position("A", entry=1.0))
+
+    async def price_fn(mint: str) -> float:
+        return 0.0
+
+    async def sell_fn(pos, price, reason) -> None:  # pragma: no cover
+        raise AssertionError("продажа по нулевой цене")
+
+    watcher = PositionWatcher(manager, price_fn, sell_fn)
+    for _ in range(watcher.BLIND_AFTER):
+        await watcher.check_once()
+    assert watcher.blind == ["A"]
+
+
+async def test_recovered_price_clears_blindness(manager):
+    manager.register_open(position("A", entry=1.0))
+    prices = [0.0, 0.0, 0.0, 1.05]
+
+    async def price_fn(mint: str) -> float:
+        return prices.pop(0)
+
+    async def sell_fn(pos, price, reason) -> None:  # pragma: no cover
+        raise AssertionError("выхода быть не должно")
+
+    watcher = PositionWatcher(manager, price_fn, sell_fn)
+    for _ in range(4):
+        await watcher.check_once()
+    assert watcher.blind == []
+    assert "A" not in watcher.price_failures
+
+
+async def test_closed_position_is_not_blind(manager):
+    manager.register_open(position("A", entry=1.0))
+
+    async def price_fn(mint: str) -> float:
+        return 0.0
+
+    async def sell_fn(pos, price, reason) -> None:  # pragma: no cover
+        raise AssertionError("не должно вызваться")
+
+    watcher = PositionWatcher(manager, price_fn, sell_fn)
+    for _ in range(watcher.BLIND_AFTER):
+        await watcher.check_once()
+    manager.register_close("A", pnl_sol=0.0)
+    assert watcher.blind == []
