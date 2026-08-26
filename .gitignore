@@ -1,0 +1,18 @@
+# локальный конфиг с ключами — в репозиторий не попадает
+config.yaml
+
+# логи пайплайна
+*.jsonl
+logs/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# os
+.DS_Store

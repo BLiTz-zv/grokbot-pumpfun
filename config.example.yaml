@@ -1,0 +1,56 @@
+# Пример конфига. Скопировать в config.yaml и подставить свои ключи.
+#   cp config.example.yaml config.yaml
+# config.yaml лежит в .gitignore и в репозиторий не попадает.
+
+mode: dry-run            # dry-run | live
+
+grok:
+  api_key: "xai-YOUR-KEY-HERE"
+  base_url: "https://api.x.ai/v1/chat/completions"
+  fast_model: "grok-4-fast"   # аудитор, нарратив, тайминг
+  checker_model: "grok-4"     # адверсариальный чекер, модель посильнее
+  timeout_seconds: 30
+  max_retries: 3
+  retry_base_delay: 1.0       # экспоненциальная задержка: base * 2**attempt
+
+solana:
+  rpc_url: "https://api.mainnet-beta.solana.com"
+  wallet_private_key: "YOUR-BASE58-PRIVATE-KEY"
+  jito:
+    enabled: true
+    block_engine_url: "https://mainnet.block-engine.jito.wtf/api/v1/bundles"
+    tip_lamports: 1000000     # чаевые за приоритет
+
+data:
+  api_key: "YOUR-DATA-PROVIDER-KEY"
+  rest_url: "https://frontend-api.pump.fun"
+  ws_url: "wss://pumpportal.fun/api/data"
+  request_timeout: 10
+
+risk:
+  max_sol_per_trade: 0.5        # потолок SOL на одну сделку
+  daily_loss_limit_sol: 2.0     # дневной лимит убытка, при достижении стоп
+  max_trades_per_day: 20        # максимум сделок в день
+  max_open_positions: 3         # максимум одновременно открытых позиций
+  stop_loss_pct: 30.0           # стоп-лосс в процентах, мониторится в фоне
+  stop_loss_poll_seconds: 15
+
+filter:
+  min_unique_buyers: 5          # минимум уникальных покупателей
+  max_curve_progress: 0.40      # заполнение кривой меньше 40%
+  require_metadata: true        # есть имя и картинка
+  min_age_seconds: 120          # возраст больше 2 минут
+  max_risk_score: 7.0           # отсечка анализатора, 0..10
+  min_total_score: 0.65         # минимальный скоринг для похода к чекеру
+
+scoring:
+  weights:
+    audit: 0.30                 # агент-аудитор: доля органики и отсутствие флагов
+    narrative: 0.25             # агент-нарратив: мем-потенциал
+    timing: 0.15                # агент-тайминг: состояние рынка
+    metrics: 0.30               # метрики анализатора кодом
+  timing_cache_seconds: 900     # кэш тайминг-агента, 15 минут
+
+logging:
+  path: "logs/trades.jsonl"
+  level: "INFO"
