@@ -170,6 +170,7 @@ class TradeLog:
                 "type": "close",
                 "mint": position.mint,
                 "symbol": position.symbol,
+                "creator": position.creator,
                 "entry_price": position.entry_price,
                 "exit_price": exit_price,
                 "pnl_sol": round(pnl_sol, 6),

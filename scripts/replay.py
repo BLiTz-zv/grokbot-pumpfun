@@ -120,8 +120,34 @@ def main() -> int:
         if losses:
             print(f"  худшая:       {min(r['pnl_sol'] for r in losses):+.4f} SOL")
         print(f"  среднее удержание: {sum(holds) / len(holds) / 60:.1f} мин")
-        by_reason = Counter(r.get("reason", "?") for r in closes)
-        print("  причины закрытия: " + ", ".join(f"{k} × {v}" for k, v in by_reason.most_common()))
+
+        print("\n  Чем кончаются позиции")
+        print(f"    {'правило':<16} {'сделок':>6} {'PnL':>10} {'средний %':>10} {'держали':>9}")
+        by_reason: dict[str, list[dict]] = defaultdict(list)
+        for record in closes:
+            by_reason[record.get("reason", "?")].append(record)
+        for reason in sorted(by_reason, key=lambda r: -len(by_reason[r])):
+            group = by_reason[reason]
+            pnl_sum = sum(r.get("pnl_sol", 0.0) for r in group)
+            pct = sum(r.get("pnl_pct", 0.0) for r in group) / len(group)
+            hold = sum(r.get("hold_seconds", 0.0) for r in group) / len(group) / 60
+            print(f"    {reason:<16} {len(group):>6} {pnl_sum:>+10.4f} "
+                  f"{pct:>+10.1f} {hold:>7.0f}м")
+
+        # -- создатели -----------------------------------------------------
+        by_creator: dict[str, list[dict]] = defaultdict(list)
+        for record in closes:
+            creator = record.get("creator")
+            if creator:
+                by_creator[creator].append(record)
+        repeats = {c: rows for c, rows in by_creator.items() if len(rows) > 1}
+        if repeats:
+            print("\n  Создатели, чьи токены брали не по одному разу")
+            for creator, rows in sorted(repeats.items(), key=lambda kv: -len(kv[1]))[:5]:
+                pnl_sum = sum(r.get("pnl_sol", 0.0) for r in rows)
+                worst = min(r.get("pnl_pct", 0.0) for r in rows)
+                print(f"    {creator[:12]:<14} сделок {len(rows):>2}  "
+                      f"PnL {pnl_sum:>+8.4f}  худшая {worst:>+7.1f}%")
     elif buys:
         print("\nЗакрытых позиций нет — все покупки ещё в рынке.")
 
