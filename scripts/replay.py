@@ -84,7 +84,7 @@ def main() -> int:
             stage_total = sum(by_stage[stage].values())
             print(f"  [{stage}]  {stage_total}")
             for reason, count in by_stage[stage].most_common():
-                print(f"      {reason:<28} {count:>5}  {bar(count, len(skips))}")
+                print(f"      {reason[:28]:<28} {count:>5}  {bar(count, len(skips))}")
 
     # -- скоринг -----------------------------------------------------------
     scored = [r for r in records if (r.get("scores") or {}).get("total") is not None]

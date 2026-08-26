@@ -79,7 +79,7 @@ def render(path: str, tail: int) -> str:
         out.append(rule("отсев сегодня"))
         reasons = Counter(r.get("reason", "?") for r in today_skips)
         for reason, count in reasons.most_common(6):
-            out.append(f"  {reason:<30} {count:>5}")
+            out.append(f"  {reason[:30]:<30} {count:>5}")
 
     out.append(rule(f"последние события ({tail})"))
     for record in records[-tail:]:
