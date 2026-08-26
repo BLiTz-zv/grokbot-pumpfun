@@ -50,6 +50,21 @@ REJECT = json.dumps({"approve": False, "reason": "органика не бьёт
                      "flags": ["contradiction"], "confidence": 0.9})
 
 
+# Резервы кривой в моке — изменяемые: через них тесты роняют цену.
+CURVE = {"sol": 30_000_000_000, "tokens": 900_000_000_000_000}
+
+
+@pytest.fixture(autouse=True)
+def _reset_curve():
+    CURVE["sol"], CURVE["tokens"] = 30_000_000_000, 900_000_000_000_000
+    yield
+
+
+def crash_price(factor: float) -> None:
+    """Обвалить цену в `factor` раз относительно текущей."""
+    CURVE["sol"] = int(CURVE["sol"] * factor)
+
+
 def data_handler(request: httpx.Request) -> httpx.Response:
     """Провайдер данных: холдеры, сделки, карточка токена."""
     path = request.url.path
@@ -68,8 +83,8 @@ def data_handler(request: httpx.Request) -> httpx.Response:
         "description": "милейший кот интернета",
         "twitter": "https://x.com/cat", "telegram": "https://t.me/cat",
         "website": "https://cat.fun",
-        "virtual_sol_reserves": 30_000_000_000,
-        "virtual_token_reserves": 900_000_000_000_000,
+        "virtual_sol_reserves": CURVE["sol"],
+        "virtual_token_reserves": CURVE["tokens"],
     })
 
 
@@ -81,6 +96,7 @@ def config(tmp_path) -> Config:
     cfg.grok.retry_base_delay = 0.0
     cfg.logging.path = str(tmp_path / "trades.jsonl")
     cfg.ops.state_path = str(tmp_path / "state.json")
+    cfg.ops.reputation_path = str(tmp_path / "creators.json")
     cfg.filter.min_total_score = 0.65
     return cfg
 
@@ -204,6 +220,7 @@ async def test_stop_loss_closes_position_and_logs_pnl(config):
 
 async def test_restart_picks_up_open_position(config):
     """Поднятый заново процесс не покупает то же самое второй раз."""
+    config.filter.one_position_per_creator = False   # проверяем именно риск-гейт
     first = Pipeline(config)
     wire(first, APPROVE)
     await first.process(fresh_token())
@@ -419,3 +436,92 @@ async def test_serve_runs_then_stops_cleanly(config):
     saved = StateStore(config.ops.state_path).load()
     assert saved is not None and "Mint1111" in saved.positions
     assert [r["type"] for r in read_log(config.logging.path)] == ["buy"]
+
+
+# --- память о создателях --------------------------------------------------
+
+
+async def test_creator_who_rugged_is_blocked_next_time(config):
+    """Слив попадает в книгу, и следующий токен того же адреса не доходит
+    до единого запроса к Grok."""
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    await pipeline.process(fresh_token())
+    position = pipeline.risk.positions["Mint1111"]
+
+    crash_price(0.1)                      # токен сложился в десять раз
+    await pipeline._sell(position, price=await pipeline._price(position.mint),
+                         reason="stop_loss")
+    assert pipeline.reputation.creators["Creator1"].rugs == 1
+
+    calls_before = pipeline.grok_ops.budget.spent
+    другой = fresh_token()
+    другой.mint = "Mint2222"
+    assert await pipeline.process(другой) is None
+    assert pipeline.grok_ops.budget.spent == calls_before      # агентов не звали
+
+    records = list(read_log(config.logging.path))
+    assert records[-1]["stage"] == "reputation"
+    assert "сливал" in records[-1]["detail"]
+
+
+async def test_blocklist_survives_restart(config):
+    first = Pipeline(config)
+    wire(first, APPROVE)
+    await first.process(fresh_token())
+    position = first.risk.positions["Mint1111"]
+    crash_price(0.05)
+    await first._sell(position, price=await first._price(position.mint), reason="stop_loss")
+    await first.shutdown()
+
+    second = Pipeline(config)
+    wire(second, APPROVE)
+    second.restore()
+    новый = fresh_token()
+    новый.mint = "Mint3333"
+    assert await second.process(новый) is None
+    assert list(read_log(config.logging.path))[-1]["stage"] == "reputation"
+
+
+async def test_second_token_from_same_creator_is_one_bet(config):
+    """Два токена одного деплойера сливают вместе — это одна ставка."""
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    await pipeline.process(fresh_token())
+
+    второй = fresh_token()
+    второй.mint = "Mint4444"
+    assert await pipeline.process(второй) is None
+    records = list(read_log(config.logging.path))
+    assert records[-1]["stage"] == "reputation"
+    assert "уже открыта позиция" in records[-1]["detail"]
+
+
+async def test_moderate_loss_does_not_blacklist(config):
+    config.filter.rug_loss_pct = 60.0
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    await pipeline.process(fresh_token())
+    position = pipeline.risk.positions["Mint1111"]
+
+    crash_price(0.75)                     # минус 25%: неприятно, но не слив
+    await pipeline._sell(position, price=await pipeline._price(position.mint),
+                         reason="stop_loss")
+    assert pipeline.reputation.creators["Creator1"].rugs == 0
+    assert pipeline._creator_verdict(fresh_token()) is None
+
+
+async def test_reputation_can_be_switched_off(config):
+    config.filter.block_creator_after_rugs = 0
+    config.filter.one_position_per_creator = False
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    await pipeline.process(fresh_token())
+    position = pipeline.risk.positions["Mint1111"]
+    crash_price(0.05)
+    await pipeline._sell(position, price=await pipeline._price(position.mint),
+                         reason="stop_loss")
+
+    другой = fresh_token()
+    другой.mint = "Mint5555"
+    assert await pipeline.process(другой) is not None      # куплен, несмотря на слив

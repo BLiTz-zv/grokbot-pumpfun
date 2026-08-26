@@ -245,6 +245,7 @@ class Position(BaseModel):
 
     mint: str
     symbol: str | None = None
+    creator: str | None = None
     entry_price: float = 0.0
     peak_price: float = 0.0          # максимум с момента входа, для трейлинга
     sol_spent: float = 0.0
@@ -334,6 +335,11 @@ class FilterConfig(BaseModel):
     min_age_seconds: float = 120.0
     max_risk_score: float = 7.0
     min_total_score: float = 0.65
+    # Память о создателях. 0 в block_creator_after_rugs выключает правило.
+    block_creator_after_rugs: int = 1
+    rug_loss_pct: float = 60.0            # убыток от этого уровня считается сливом
+    one_position_per_creator: bool = True
+    forget_creators_after_days: float = 30.0
 
 
 class ScoringWeights(BaseModel):
@@ -359,6 +365,7 @@ class OpsConfig(BaseModel):
     """Эксплуатационные настройки: то, что нужно процессу, живущему сутками."""
 
     state_path: str = "state/pipeline.json"   # переживает рестарт
+    reputation_path: str = "state/creators.json"   # память о создателях
     health_port: int = 0                      # 0 — health-эндпоинт выключен
     health_host: str = "127.0.0.1"
     heartbeat_seconds: float = 300.0          # строка живости в лог
@@ -516,6 +523,10 @@ class Config(BaseModel):
             errors.append("filter.max_risk_score должен быть в интервале [0, 10]")
         if flt.min_age_seconds < 0:
             errors.append("filter.min_age_seconds не может быть отрицательным")
+        if not 0 < flt.rug_loss_pct <= 100:
+            errors.append("filter.rug_loss_pct должен быть в интервале (0, 100]")
+        if flt.block_creator_after_rugs < 0:
+            errors.append("filter.block_creator_after_rugs не может быть отрицательным")
 
         weights = self.scoring.weights
         if sum(max(0.0, w) for w in weights.model_dump().values()) <= 0:

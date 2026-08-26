@@ -46,6 +46,7 @@ from .ops import (
     drain,
     install_signal_handlers,
 )
+from .reputation import ReputationBook
 from .risk import PositionWatcher, RiskManager
 from .scoring import compute_scores, passes_threshold, weakest_component
 from .state import StateStore
@@ -69,6 +70,7 @@ class Pipeline:
         self.trade_log = TradeLog.from_config(config)
         self.store = store if store is not None else StateStore(config.ops.state_path)
         self.risk = RiskManager(config, store=self.store)
+        self.reputation = ReputationBook.load(config.ops.reputation_path)
         self.grok_ops = GrokOps(config, self.metrics)
 
         self._grok_client = httpx.AsyncClient(
@@ -115,7 +117,10 @@ class Pipeline:
         await self._grok_client.aclose()
 
     def restore(self) -> None:
-        """Поднять состояние прошлого запуска: позиции и лимиты дня."""
+        """Поднять состояние прошлого запуска: позиции, лимиты дня, репутацию."""
+        forgotten = self.reputation.forget_older_than(self.config.filter.forget_creators_after_days)
+        log.info("книга репутации: %s%s", self.reputation.summary(),
+                 f", забыто устаревших {forgotten}" if forgotten else "")
         if self.risk.restore():
             # Бюджет вызовов Grok продолжается с того же места, иначе
             # рестарт-петля выест дневной лимит за час.
@@ -156,6 +161,7 @@ class Pipeline:
         self._tasks.clear()
         self._sync_counters()
         self.risk.persist()
+        self._save_reputation()
         await self.watcher.stop()
         await self.heartbeat.stop()
         await self.health.stop()
@@ -203,6 +209,14 @@ class Pipeline:
         """Один токен от метрик до покупки. None, если отсеян."""
         log.info("разбираем %s (%s), покупателей %d",
                  token.symbol or "?", token.mint[:8], token.unique_buyers)
+        self.reputation.observe(token.creator)
+
+        # 1.5. Память о создателе. Бесплатная ступень перед всеми платными:
+        # адрес, который уже сливал, дальше не идёт.
+        blocked = self._creator_verdict(token)
+        if blocked:
+            return self._reject(Analysis(token=token), stage="reputation",
+                                reason="creator_blocked", detail=blocked)
 
         # 2. Анализатор: сеть параллельно, метрики кодом.
         info, holders, trades = await self.analyzer.fetch(token.mint)
@@ -260,6 +274,7 @@ class Pipeline:
         position = new_position(token, result, analysis.scores.total)
         self._sync_counters()
         self.risk.register_open(position)
+        self.reputation.record_open(token.creator)
         self.trade_log.buy(analysis, size_sol=decision.size_sol,
                            entry_price=result.price, tx_hash=result.tx_hash)
         self.metrics.inc("buys")
@@ -281,6 +296,24 @@ class Pipeline:
         return None
 
     # -- состояние и наблюдаемость ----------------------------------------
+
+    def _creator_verdict(self, token: Token) -> str | None:
+        """Причина не связываться с создателем этого токена, или None."""
+        flt = self.config.filter
+        verdict = self.reputation.verdict(token.creator, flt.block_creator_after_rugs)
+        if verdict:
+            return verdict
+        if flt.one_position_per_creator and token.creator:
+            same = [p.mint[:8] for p in self.risk.positions.values()
+                    if p.creator == token.creator]
+            if same:
+                # Два токена одного деплойера — это одна ставка, а не две:
+                # сливают их обычно вместе.
+                return f"у создателя уже открыта позиция ({', '.join(same)})"
+        return None
+
+    def _save_reputation(self) -> None:
+        self.reputation.save(self.config.ops.reputation_path)
 
     def _sync_counters(self) -> None:
         """Перенести расход Grok в состояние, которое ляжет на диск."""
@@ -307,6 +340,9 @@ class Pipeline:
             "grok_budget_remaining": self.grok_ops.budget.remaining,
             "grok_tokens_in": self.grok_ops.tokens_in,
             "grok_tokens_out": self.grok_ops.tokens_out,
+            "blocked_creators": sum(
+                1 for r in self.reputation.creators.values() if r.is_known_bad
+            ),
         }
 
     def _market_snapshot(self) -> dict[str, Any]:
@@ -336,8 +372,18 @@ class Pipeline:
             return
         proceeds = result.sol_amount if result.ok else position.token_amount * price
         pnl = proceeds - position.sol_spent
+        exit_price = result.price or price
+        change_pct = (
+            (exit_price - position.entry_price) / position.entry_price * 100.0
+            if position.entry_price else 0.0
+        )
         self._sync_counters()
         self.risk.register_close(position.mint, pnl_sol=pnl)
+        self.reputation.record_close(
+            position.creator, pnl_sol=pnl, pnl_pct=change_pct,
+            rug_loss_pct=self.config.filter.rug_loss_pct,
+        )
+        self._save_reputation()
         self.trade_log.close(position, exit_price=result.price or price,
                              pnl_sol=pnl, reason=reason, tx_hash=result.tx_hash)
         self.metrics.inc("closes")

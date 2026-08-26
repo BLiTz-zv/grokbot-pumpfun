@@ -56,6 +56,11 @@ filter:
   min_age_seconds: 120          # возраст больше 2 минут
   max_risk_score: 7.0           # отсечка анализатора, 0..10
   min_total_score: 0.65         # минимальный скоринг для похода к чекеру
+  # Память о создателях токенов, считается по собственным закрытым сделкам.
+  block_creator_after_rugs: 1   # столько сливов — и адрес отсекается; 0 выключает
+  rug_loss_pct: 60.0            # убыток от этого уровня засчитывается как слив
+  one_position_per_creator: true  # два токена одного деплойера — одна ставка
+  forget_creators_after_days: 30  # чистые адреса забываются, адреса со сливами нет
 
 scoring:
   weights:
@@ -73,6 +78,7 @@ logging:
 
 ops:
   state_path: "state/pipeline.json"   # позиции и счётчики дня, переживают рестарт
+  reputation_path: "state/creators.json"  # память о создателях токенов
   health_port: 0                      # 0 — выключено; иначе GET /healthz и /metrics
   health_host: "127.0.0.1"
   heartbeat_seconds: 300              # строка живости в лог
