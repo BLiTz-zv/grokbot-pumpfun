@@ -14,12 +14,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 from typing import Any, ClassVar, TypeVar
 
 import httpx
 from pydantic import BaseModel, ValidationError
 
 from ..models import Config
+from ..ops import GrokOps
 
 log = logging.getLogger(__name__)
 
@@ -38,9 +40,15 @@ class GrokAgent:
     result_model: ClassVar[type[BaseModel]] = BaseModel
     use_checker_model: ClassVar[bool] = False
 
-    def __init__(self, config: Config, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        config: Config,
+        client: httpx.AsyncClient | None = None,
+        ops: GrokOps | None = None,
+    ) -> None:
         self.config = config
         self.grok = config.grok
+        self.ops = ops              # общие на процесс ограничители; None — без них
         self._client = client
         self._owns_client = client is None
 
@@ -130,32 +138,76 @@ class GrokAgent:
         last_error: Exception | None = None
 
         for attempt in range(self.grok.max_retries):
+            # Ограничители спрашиваем на каждой попытке: цепь могла
+            # разомкнуться, а бюджет кончиться, пока мы ретраили.
+            if self.ops is not None:
+                blocked = self.ops.precheck(self.name)
+                if blocked:
+                    raise GrokAgentError(blocked)
+
             if attempt:
-                delay = self.grok.retry_base_delay * (2 ** (attempt - 1))
-                log.debug("[%s] ретрай %d через %.1fs", self.name, attempt, delay)
-                await asyncio.sleep(delay)
+                await asyncio.sleep(self._backoff(attempt))
             try:
-                resp = await client.post(
-                    self.grok.base_url,
-                    json=self._payload(message),
-                    headers=headers,
-                    timeout=self.grok.timeout_seconds,
-                )
+                async with self._slot():
+                    resp = await client.post(
+                        self.grok.base_url,
+                        json=self._payload(message),
+                        headers=headers,
+                        timeout=self.grok.timeout_seconds,
+                    )
                 if resp.status_code >= 500 or resp.status_code == 429:
                     last_error = GrokAgentError(f"HTTP {resp.status_code}")
+                    self._failed()
                     continue
                 resp.raise_for_status()
                 body = resp.json()
-                return body["choices"][0]["message"]["content"]
+                content = body["choices"][0]["message"]["content"]
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_error = exc
+                self._failed()
             except (KeyError, IndexError, TypeError, ValueError) as exc:
                 last_error = GrokAgentError(f"неожиданная форма ответа: {exc}")
+                self._failed()
             except httpx.HTTPStatusError as exc:
-                # 4xx кроме 429 ретраить бессмысленно
+                # 4xx кроме 429 ретраить бессмысленно: ключ или запрос не те
+                self._failed()
                 raise GrokAgentError(f"HTTP {exc.response.status_code}") from exc
+            else:
+                if self.ops is not None:
+                    self.ops.record_success(self.name, body.get("usage"))
+                return content
 
         raise GrokAgentError(f"после {self.grok.max_retries} попыток: {last_error}")
+
+    def _backoff(self, attempt: int) -> float:
+        """Экспоненциальная задержка с джиттером.
+
+        Джиттер важен: без него пачка агентов, стартовавшая одновременно,
+        ретраится тоже одновременно и добивает и без того больной API.
+        """
+        base = self.grok.retry_base_delay * (2 ** (attempt - 1))
+        delay = base * (0.5 + random.random())
+        log.debug("[%s] ретрай %d через %.2fs", self.name, attempt, delay)
+        return delay
+
+    def _slot(self) -> Any:
+        if self.ops is None:
+            return _NullSlot()
+        return self.ops.slot(self.name)
+
+    def _failed(self) -> None:
+        if self.ops is not None:
+            self.ops.record_failure(self.name)
+
+
+class _NullSlot:
+    """Заглушка очереди для агента без ограничителей (тесты, одиночный вызов)."""
+
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, *exc: Any) -> None:
+        return None
 
 
 # --------------------------------------------------------------------------
