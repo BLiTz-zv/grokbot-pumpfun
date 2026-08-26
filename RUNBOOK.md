@@ -89,6 +89,7 @@ python scripts/dashboard.py logs/trades.jsonl --watch 5
 | `breaker` | `closed` / `half-open` / `open` | `open` — Grok не отвечает |
 | `grok_budget_remaining` | остаток дневных вызовов | 0 — до полуночи UTC агенты молчат |
 | `halted` | дневной лимит убытка выбран | `true` — торговли сегодня не будет |
+| `blind_positions` | позиции без котировок | больше 0 — выходы по ним не работают |
 | `open_positions` | открытые позиции | больше `max_open_positions` быть не может |
 | `in_flight` | токенов в разборе | стабильно на потолке — упёрлись в лимит Grok |
 
