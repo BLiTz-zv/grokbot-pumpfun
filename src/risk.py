@@ -16,10 +16,11 @@ Grok ни о чём. Все пороги — из конфига:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from .models import Config, Position, RiskConfig, TradeDecision
 from .state import PipelineState, StateStore, describe
@@ -98,7 +99,7 @@ class RiskManager:
     # -- сутки -------------------------------------------------------------
 
     def _today(self) -> str:
-        return datetime.fromtimestamp(self.clock(), tz=timezone.utc).strftime("%Y-%m-%d")
+        return datetime.fromtimestamp(self.clock(), tz=UTC).strftime("%Y-%m-%d")
 
     def roll_day_if_needed(self) -> bool:
         """Новые сутки — обнулить счётчики. Открытые позиции не трогаем."""
@@ -267,8 +268,6 @@ class StopLossWatcher:
     async def stop(self) -> None:
         if self._task is not None:
             self._task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
             self._task = None

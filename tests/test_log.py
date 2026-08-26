@@ -26,7 +26,7 @@ def test_records_carry_mode_and_timestamp(trade_log):
     record = trade_log.skip(token(), stage="monitor", reason="few_buyers")
     assert record["mode"] == "dry-run"
     assert record["ts"] > 0
-    assert list(read_log(trade_log.path))[0]["reason"] == "few_buyers"
+    assert next(iter(read_log(trade_log.path)))["reason"] == "few_buyers"
 
 
 def test_rotation_kicks_in_at_threshold(trade_log):

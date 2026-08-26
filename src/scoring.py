@@ -28,7 +28,7 @@ def normalized_weights(weights: ScoringWeights) -> dict[str, float]:
     total = sum(raw.values())
     if total <= 0:
         # Вырожденный конфиг: равные веса лучше деления на ноль.
-        return {key: 0.25 for key in raw}
+        return dict.fromkeys(raw, 0.25)
     return {key: value / total for key, value in raw.items()}
 
 

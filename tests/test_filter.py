@@ -5,9 +5,8 @@ import time
 
 import pytest
 
-from src.models import FilterConfig, Token
+from src.models import Config, FilterConfig, Token
 from src.monitor import CURVE_COMPLETION_SOL, LaunchMonitor, parse_create_event, passes_filter
-from src.models import Config
 
 
 @pytest.fixture
@@ -21,14 +20,14 @@ def cfg() -> FilterConfig:
 
 
 def make_token(**overrides) -> Token:
-    base = dict(
-        mint="Mint111",
-        name="Doge Killer",
-        image_uri="https://img/1.png",
-        created_timestamp=time.time() - 300,
-        unique_buyers=10,
-        curve_progress=0.15,
-    )
+    base = {
+        "mint": "Mint111",
+        "name": "Doge Killer",
+        "image_uri": "https://img/1.png",
+        "created_timestamp": time.time() - 300,
+        "unique_buyers": 10,
+        "curve_progress": 0.15,
+    }
     base.update(overrides)
     return Token(**base)
 

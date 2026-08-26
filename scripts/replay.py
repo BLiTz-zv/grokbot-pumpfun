@@ -11,12 +11,12 @@ import argparse
 import sys
 import time
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.log import TradeLog, read_log  # noqa: E402
+from src.log import TradeLog, read_log
 
 BUCKETS = [(0.0, 0.5), (0.5, 0.6), (0.6, 0.7), (0.7, 0.8), (0.8, 0.9), (0.9, 1.01)]
 
@@ -24,7 +24,7 @@ BUCKETS = [(0.0, 0.5), (0.5, 0.6), (0.6, 0.7), (0.7, 0.8), (0.8, 0.9), (0.9, 1.0
 def parse_since(value: str | None) -> float:
     if not value:
         return 0.0
-    return datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+    return datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=UTC).timestamp()
 
 
 def bucket_of(score: float) -> str:

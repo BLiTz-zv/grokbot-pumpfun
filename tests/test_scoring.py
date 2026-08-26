@@ -37,7 +37,9 @@ def perfect_analysis() -> Analysis:
             organic_buyer_share=1.0,
             confidence=1.0,
         ),
-        narrative=NarrativeResult(trend_fit=1.0, virality=1.0, community_signals=1.0, launch_timing=1.0),
+        narrative=NarrativeResult(
+            trend_fit=1.0, virality=1.0, community_signals=1.0, launch_timing=1.0
+        ),
         timing=TimingResult(market_sentiment=1.0, meme_season=1.0, volume_level=1.0),
     )
 
@@ -69,7 +71,9 @@ def test_worst_analysis_scores_zero(config):
 def test_score_never_leaves_unit_interval(config):
     """Даже если модель вернёт мусор за пределами 0..1, итог остаётся в 0..1."""
     analysis = perfect_analysis()
-    analysis.narrative = NarrativeResult(trend_fit=5.0, virality=5.0, community_signals=5.0, launch_timing=5.0)
+    analysis.narrative = NarrativeResult(
+        trend_fit=5.0, virality=5.0, community_signals=5.0, launch_timing=5.0
+    )
     scores = compute_scores(analysis, config)
     assert 0.0 <= scores.total <= 1.0
     assert scores.narrative == 1.0

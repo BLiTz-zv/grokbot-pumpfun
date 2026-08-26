@@ -18,7 +18,6 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
-
 # --------------------------------------------------------------------------
 # Токен и метрики
 # --------------------------------------------------------------------------

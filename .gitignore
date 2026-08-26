@@ -17,3 +17,8 @@ venv/
 # os
 .DS_Store
 state/
+.env
+.coverage
+coverage.xml
+htmlcov/
+.ruff_cache/

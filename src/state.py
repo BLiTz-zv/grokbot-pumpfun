@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -63,10 +64,8 @@ class StateStore:
                 "состояние %s не читается (%s) — отложено в %s, стартуем с чистого",
                 self.path, exc, backup,
             )
-            try:
+            with contextlib.suppress(OSError):
                 os.replace(self.path, backup)
-            except OSError:
-                pass
             return None
 
         if state.version != STATE_VERSION:

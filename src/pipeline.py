@@ -39,8 +39,8 @@ from .models import Analysis, Config, ConfigError, Position, Token
 from .monitor import LaunchMonitor
 from .ops import (
     GrokOps,
-    Heartbeat,
     HealthServer,
+    Heartbeat,
     Metrics,
     cancel_and_wait,
     drain,
@@ -194,7 +194,8 @@ class Pipeline:
             except Exception as exc:
                 log.exception("токен %s уронил обработку: %s", token.mint, exc)
                 self.metrics.inc("errors")
-                self.trade_log.skip(token, stage="pipeline", reason="internal_error", detail=str(exc))
+                self.trade_log.skip(token, stage="pipeline",
+                                    reason="internal_error", detail=str(exc))
 
     # -- ступени -----------------------------------------------------------
 
@@ -270,7 +271,7 @@ class Pipeline:
 
     def _reject(
         self, analysis: Analysis, *, stage: str, reason: str, detail: str | None = None
-    ) -> None:
+    ) -> Analysis | None:
         """Отказ на ступени: метрика, запись в лог, конец разбора."""
         self.metrics.inc(f"skip_{stage}")
         self.trade_log.skip(
@@ -289,10 +290,7 @@ class Pipeline:
         """Снимок для /healthz и heartbeat. Ничего секретного не содержит."""
         stalled = (time.time() - self._last_event_at) > STALL_SECONDS
         breaker = self.grok_ops.breaker.state
-        if breaker == "open" or stalled:
-            state = "degraded"
-        else:
-            state = "ok"
+        state = "degraded" if breaker == "open" or stalled else "ok"
         return {
             "status": state,
             "mode": self.config.mode,

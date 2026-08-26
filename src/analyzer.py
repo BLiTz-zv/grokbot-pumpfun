@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import statistics
 from typing import Any
@@ -165,7 +166,11 @@ def compute_metrics(token: Token, holders: list[Holder], trades: list[Trade]) ->
 
     top5_share = sum(h.share for h in sorted(holders, key=lambda h: h.share, reverse=True)[:5])
     creator_share = next(
-        (h.share for h in holders if h.is_creator or (token.creator and h.address == token.creator)),
+        (
+            h.share
+            for h in holders
+            if h.is_creator or (token.creator and h.address == token.creator)
+        ),
         0.0,
     )
 
@@ -253,7 +258,7 @@ def _curve_health(buys: list[Trade]) -> float:
 
     stamps = sorted(t.timestamp for t in buys if t.timestamp)
     if len(stamps) >= 3:
-        gaps = [b - a for a, b in zip(stamps, stamps[1:]) if b > a]
+        gaps = [b - a for a, b in itertools.pairwise(stamps) if b > a]
         if gaps:
             gap_mean = statistics.fmean(gaps)
             gap_spread = statistics.pstdev(gaps) / gap_mean if gap_mean else 1.0

@@ -14,13 +14,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from .models import Config
@@ -29,7 +30,7 @@ log = logging.getLogger(__name__)
 
 
 def utc_day(ts: float) -> str:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+    return datetime.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%d")
 
 
 # --------------------------------------------------------------------------
@@ -66,10 +67,14 @@ class Metrics:
     def prometheus(self, prefix: str = "grokbot") -> str:
         """Текстовая экспозиция для Prometheus. Без зависимостей."""
         lines = [f"{prefix}_uptime_seconds {self.uptime_seconds:.1f}"]
-        for name, value in sorted(self.counters.items()):
-            lines.append(f"{prefix}_{_safe(name)}_total {value}")
-        for name, value in sorted(self.gauges.items()):
-            lines.append(f"{prefix}_{_safe(name)} {value}")
+        lines += [
+            f"{prefix}_{_safe(name)}_total {count}"
+            for name, count in sorted(self.counters.items())
+        ]
+        lines += [
+            f"{prefix}_{_safe(name)} {value}"
+            for name, value in sorted(self.gauges.items())
+        ]
         return "\n".join(lines) + "\n"
 
 
@@ -339,7 +344,7 @@ class HealthServer:
                 "Connection: close\r\n\r\n".encode("latin-1") + payload
             )
             await writer.drain()
-        except (asyncio.TimeoutError, ConnectionError):
+        except (TimeoutError, ConnectionError):
             pass
         except Exception as exc:
             log.warning("health-запрос упал: %s", exc)
@@ -393,10 +398,8 @@ class Heartbeat:
     async def stop(self) -> None:
         if self._task is not None:
             self._task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
             self._task = None
 
 
@@ -423,7 +426,9 @@ def install_signal_handlers(stop: Callable[[str], Any]) -> None:
         try:
             loop.add_signal_handler(sig, stop, sig.name)
         except NotImplementedError:      # Windows
-            signal.signal(sig, lambda *_: stop(sig.name))
+            # sig связываем значением по умолчанию: иначе оба обработчика
+            # доложат об одном сигнале — том, что остался в конце цикла
+            signal.signal(sig, lambda *_, name=sig.name: stop(name))
 
 
 async def cancel_and_wait(task: asyncio.Task | None) -> None:
@@ -431,10 +436,8 @@ async def cancel_and_wait(task: asyncio.Task | None) -> None:
     if task is None:
         return
     task.cancel()
-    try:
+    with contextlib.suppress(asyncio.CancelledError):
         await task
-    except asyncio.CancelledError:
-        pass
 
 
 AsyncCallable = Callable[[], Awaitable[Any]]

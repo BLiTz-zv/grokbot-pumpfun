@@ -68,7 +68,11 @@ def parse_create_event(payload: dict[str, Any]) -> Token | None:
 
     sol_in_curve = float(payload.get("vSolInBondingCurve") or 0.0)
     created = payload.get("timestamp") or payload.get("createdTimestamp")
-    created_ts = float(created) / 1000.0 if created and float(created) > 1e11 else float(created or time.time())
+    created_ts = (
+        float(created) / 1000.0
+        if created and float(created) > 1e11
+        else float(created or time.time())
+    )
 
     return Token(
         mint=mint,
@@ -219,7 +223,7 @@ class LaunchMonitor:
                     while True:
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=sweeper_delay)
-                        except asyncio.TimeoutError:
+                        except TimeoutError:
                             raw = None
                         if raw:
                             try:
