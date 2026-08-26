@@ -368,3 +368,54 @@ async def test_live_executor_stub_does_not_crash_the_pipeline(config):
     records = list(read_log(config.logging.path))
     assert records[-1]["stage"] == "executor"
     assert records[-1]["reason"] == "executor_not_implemented"
+
+
+# --- полный жизненный цикл ------------------------------------------------
+
+
+async def test_serve_runs_then_stops_cleanly(config):
+    """Старт, обработка токена, health наружу, SIGTERM, сохранение состояния."""
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    config.ops.health_port = port
+    config.ops.heartbeat_seconds = 3600      # в тесте не нужен
+    config.ops.shutdown_grace_seconds = 5
+
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+
+    processed = asyncio.Event()
+
+    async def fake_stream():
+        yield fresh_token()
+        processed.set()
+        await asyncio.sleep(3600)            # дальше поток просто живёт
+
+    pipeline.monitor.stream = fake_stream    # type: ignore[method-assign]
+
+    async with pipeline:
+        serving = asyncio.create_task(pipeline.serve())
+        await asyncio.wait_for(processed.wait(), timeout=5)
+        for _ in range(50):                  # ждём, пока токен доедет до покупки
+            if pipeline.risk.open_count:
+                break
+            await asyncio.sleep(0.02)
+
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+        await writer.drain()
+        head, _, body = (await reader.read()).decode().partition("\r\n\r\n")
+        writer.close()
+        assert "200" in head.split("\r\n")[0]
+        assert json.loads(body)["open_positions"] == 1
+
+        pipeline.request_stop("SIGTERM")
+        assert await asyncio.wait_for(serving, timeout=10) == 0
+
+    saved = StateStore(config.ops.state_path).load()
+    assert saved is not None and "Mint1111" in saved.positions
+    assert [r["type"] for r in read_log(config.logging.path)] == ["buy"]

@@ -1,6 +1,8 @@
 """Базовый фильтр монитора: он режет 94% потока, поэтому граничные
 значения важнее всего остального."""
 
+import asyncio
+import json
 import time
 
 import pytest
@@ -235,3 +237,116 @@ def test_pending_buffer_is_bounded(monkeypatch):
         })
     assert len(mon.pending) <= 3
     assert skips and skips[0][1] == "buffer_overflow"
+
+
+# --- поток из сокета ------------------------------------------------------
+
+
+class FakeWebSocket:
+    """Сокет, отдающий заготовленные сообщения, потом замолкающий."""
+
+    def __init__(self, messages: list[dict]) -> None:
+        self.messages = [json.dumps(m) for m in messages]
+        self.sent: list[dict] = []
+
+    async def send(self, raw: str) -> None:
+        self.sent.append(json.loads(raw))
+
+    async def recv(self) -> str:
+        if self.messages:
+            return self.messages.pop(0)
+        await asyncio.sleep(3600)          # дальше тишина
+        raise AssertionError("недостижимо")
+
+    async def __aenter__(self) -> "FakeWebSocket":
+        return self
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+
+def patch_socket(monkeypatch, sockets: list) -> list:
+    """Подменить websockets.connect последовательностью сокетов."""
+    import src.monitor as monitor_module
+
+    opened: list = []
+
+    def connect(url, **kwargs):
+        opened.append(url)
+        socket = sockets.pop(0)
+        if isinstance(socket, Exception):
+            raise socket
+        return socket
+
+    monkeypatch.setattr(monitor_module.websockets, "connect", connect)
+    return opened
+
+
+async def test_stream_yields_matured_token(monkeypatch):
+    created = (time.time() - 300) * 1000
+    ws = FakeWebSocket([
+        {"txType": "create", "mint": "A", "name": "Cat", "image": "i", "timestamp": created},
+        {"txType": "buy", "mint": "A", "traderPublicKey": "w1"},
+        {"txType": "buy", "mint": "A", "traderPublicKey": "w2"},
+        {"txType": "buy", "mint": "A", "traderPublicKey": "w3"},
+    ])
+    patch_socket(monkeypatch, [ws])
+
+    mon = make_monitor([])
+    stream = mon.stream()
+    token = await asyncio.wait_for(stream.__anext__(), timeout=2)
+    await stream.aclose()
+
+    assert token.mint == "A"
+    methods = [m["method"] for m in ws.sent]
+    assert methods[0] == "subscribeNewToken"
+    assert "subscribeTokenTrade" in methods       # подписались на сделки лонча
+    assert "unsubscribeTokenTrade" in methods     # и отписались, когда отдали
+
+
+async def test_stream_reconnects_after_drop(monkeypatch):
+    created = (time.time() - 300) * 1000
+    good = FakeWebSocket([
+        {"txType": "create", "mint": "B", "name": "Cat", "image": "i", "timestamp": created},
+        {"txType": "buy", "mint": "B", "traderPublicKey": "w1"},
+        {"txType": "buy", "mint": "B", "traderPublicKey": "w2"},
+        {"txType": "buy", "mint": "B", "traderPublicKey": "w3"},
+    ])
+    opened = patch_socket(monkeypatch, [OSError("сокет отвалился"), good])
+    real_sleep = asyncio.sleep
+    # пауза перед переподключением нужна в проде, но не в тесте
+    monkeypatch.setattr(asyncio, "sleep", lambda delay, *a, **k: real_sleep(0))
+
+    mon = make_monitor([])
+    stream = mon.stream()
+    token = await asyncio.wait_for(stream.__anext__(), timeout=2)
+    await stream.aclose()
+
+    assert token.mint == "B"
+    assert len(opened) == 2          # первый коннект упал, второй сработал
+
+
+async def test_stream_survives_broken_json(monkeypatch):
+    created = (time.time() - 300) * 1000
+
+    class NoisyWebSocket(FakeWebSocket):
+        async def recv(self) -> str:
+            if self.messages:
+                return self.messages.pop(0)
+            await asyncio.sleep(3600)
+            raise AssertionError("недостижимо")
+
+    ws = NoisyWebSocket([
+        {"txType": "create", "mint": "C", "name": "Cat", "image": "i", "timestamp": created},
+        {"txType": "buy", "mint": "C", "traderPublicKey": "w1"},
+        {"txType": "buy", "mint": "C", "traderPublicKey": "w2"},
+        {"txType": "buy", "mint": "C", "traderPublicKey": "w3"},
+    ])
+    ws.messages.insert(1, "{битый json")
+    patch_socket(monkeypatch, [ws])
+
+    mon = make_monitor([])
+    stream = mon.stream()
+    token = await asyncio.wait_for(stream.__anext__(), timeout=2)
+    await stream.aclose()
+    assert token.mint == "C"

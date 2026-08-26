@@ -27,6 +27,13 @@ SNIPER_WINDOW_SECONDS = 15.0
 TRADE_LIMIT = 200
 HOLDER_LIMIT = 50
 
+# Безусловные вето. Взвешенная сумма их размывает: токен с создателем на
+# четверти предложения набирал приемлемый риск за счёт хорошей кривой и
+# живых соцсетей. Такие условия не компенсируются ничем, поэтому они
+# выставляют максимальный риск, а не прибавляют к нему.
+CREATOR_SHARE_VETO = 0.25
+TOP5_SHARE_VETO = 0.80
+
 
 class Analyzer:
     """Тянет сырые данные и сводит их в TokenMetrics."""
@@ -190,6 +197,10 @@ def compute_metrics(token: Token, holders: list[Holder], trades: list[Trade]) ->
         curve_health=curve_health,
         trade_count=len(trades),
     )
+    veto = _veto_reason(creator_share, top5_share)
+    if veto:
+        log.info("%s отсечён безусловно: %s", token.mint[:8], veto)
+        risk = 10.0
 
     return TokenMetrics(
         top5_share=round(min(1.0, top5_share), 4),
@@ -269,6 +280,15 @@ def _curve_health(buys: list[Trade]) -> float:
         pace_health = 0.0
 
     return max(0.0, min(1.0, 0.6 * size_health + 0.4 * pace_health))
+
+
+def _veto_reason(creator_share: float, top5_share: float) -> str | None:
+    """Условие, при котором остальные метрики уже не важны."""
+    if creator_share >= CREATOR_SHARE_VETO:
+        return f"создатель держит {creator_share:.0%} предложения"
+    if top5_share >= TOP5_SHARE_VETO:
+        return f"топ-5 кошельков держат {top5_share:.0%}"
+    return None
 
 
 def _risk_score(
