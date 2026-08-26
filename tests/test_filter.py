@@ -1,0 +1,208 @@
+"""Базовый фильтр монитора: он режет 94% потока, поэтому граничные
+значения важнее всего остального."""
+
+import time
+
+import pytest
+
+from src.models import FilterConfig, Token
+from src.monitor import CURVE_COMPLETION_SOL, LaunchMonitor, parse_create_event, passes_filter
+from src.models import Config
+
+
+@pytest.fixture
+def cfg() -> FilterConfig:
+    return FilterConfig(
+        min_unique_buyers=5,
+        max_curve_progress=0.40,
+        require_metadata=True,
+        min_age_seconds=120.0,
+    )
+
+
+def make_token(**overrides) -> Token:
+    base = dict(
+        mint="Mint111",
+        name="Doge Killer",
+        image_uri="https://img/1.png",
+        created_timestamp=time.time() - 300,
+        unique_buyers=10,
+        curve_progress=0.15,
+    )
+    base.update(overrides)
+    return Token(**base)
+
+
+def test_healthy_token_passes(cfg):
+    ok, reason = passes_filter(make_token(), cfg)
+    assert ok and reason == "ok"
+
+
+def test_missing_metadata_rejected(cfg):
+    ok, reason = passes_filter(make_token(image_uri=None), cfg)
+    assert not ok and reason == "no_metadata"
+
+    ok, reason = passes_filter(make_token(name=None), cfg)
+    assert not ok and reason == "no_metadata"
+
+
+def test_metadata_ignored_when_not_required(cfg):
+    cfg.require_metadata = False
+    ok, _ = passes_filter(make_token(image_uri=None), cfg)
+    assert ok
+
+
+def test_too_young_rejected(cfg):
+    ok, reason = passes_filter(make_token(created_timestamp=time.time() - 60), cfg)
+    assert not ok and reason == "too_young"
+
+
+def test_age_boundary_is_inclusive(cfg):
+    """Ровно 120 секунд — уже проходит, 119.9 — нет."""
+    ok, _ = passes_filter(make_token(created_timestamp=time.time() - 120.5), cfg)
+    assert ok
+    ok, reason = passes_filter(make_token(created_timestamp=time.time() - 119.0), cfg)
+    assert not ok and reason == "too_young"
+
+
+def test_buyers_boundary(cfg):
+    ok, _ = passes_filter(make_token(unique_buyers=5), cfg)
+    assert ok
+    ok, reason = passes_filter(make_token(unique_buyers=4), cfg)
+    assert not ok and reason == "few_buyers"
+
+
+def test_curve_boundary(cfg):
+    ok, _ = passes_filter(make_token(curve_progress=0.399), cfg)
+    assert ok
+    ok, reason = passes_filter(make_token(curve_progress=0.40), cfg)
+    assert not ok and reason == "curve_too_full"
+
+
+def test_terminal_reasons_win_over_temporary(cfg):
+    """Порядок причин важен: безнадёжный токен не должен висеть в буфере
+    как 'too_young' или 'few_buyers' — иначе он там до протухания."""
+    token = make_token(image_uri=None, created_timestamp=time.time())
+    ok, reason = passes_filter(token, cfg)
+    assert not ok and reason == "no_metadata"
+
+    token = make_token(curve_progress=0.9, unique_buyers=0, created_timestamp=time.time())
+    ok, reason = passes_filter(token, cfg)
+    assert not ok and reason == "curve_too_full"
+
+
+# --- разбор события сокета ------------------------------------------------
+
+
+def test_parse_create_event():
+    token = parse_create_event(
+        {
+            "txType": "create",
+            "mint": "Abc",
+            "name": "Cat",
+            "symbol": "CAT",
+            "image": "https://img",
+            "traderPublicKey": "Creator1",
+            "vSolInBondingCurve": 8.5,
+            "marketCapSol": 30.0,
+        }
+    )
+    assert token is not None
+    assert token.mint == "Abc"
+    assert token.curve_progress == pytest.approx(8.5 / CURVE_COMPLETION_SOL)
+
+
+def test_parse_ignores_trades():
+    assert parse_create_event({"txType": "buy", "mint": "Abc"}) is None
+    assert parse_create_event({"txType": "create"}) is None
+
+
+# --- буфер монитора -------------------------------------------------------
+
+
+def make_monitor(skips: list) -> LaunchMonitor:
+    config = Config()
+    config.filter = FilterConfig(min_unique_buyers=3, min_age_seconds=120.0)
+    return LaunchMonitor(config, on_skip=lambda t, r: skips.append((t.mint, r)))
+
+
+def test_new_launch_is_buffered_not_emitted():
+    skips: list = []
+    mon = make_monitor(skips)
+    assert mon.handle_event({"txType": "create", "mint": "A", "name": "n", "image": "i"}) is None
+    assert "A" in mon.pending
+
+
+def test_token_emitted_once_it_matures():
+    skips: list = []
+    mon = make_monitor(skips)
+    mon.handle_event(
+        {
+            "txType": "create",
+            "mint": "A",
+            "name": "n",
+            "image": "i",
+            "traderPublicKey": "creator",
+            "timestamp": (time.time() - 300) * 1000,
+        }
+    )
+    for wallet in ("w1", "w2", "w3"):
+        out = mon.handle_event({"txType": "buy", "mint": "A", "traderPublicKey": wallet})
+    assert out is not None  # отдан ровно на третьем уникальном покупателе
+    assert out.mint == "A"
+    assert "A" not in mon.pending
+    assert skips == []
+
+
+def test_same_wallet_does_not_inflate_buyer_count():
+    skips: list = []
+    mon = make_monitor(skips)
+    mon.handle_event(
+        {"txType": "create", "mint": "A", "name": "n", "image": "i",
+         "timestamp": (time.time() - 300) * 1000}
+    )
+    for _ in range(10):
+        out = mon.handle_event({"txType": "buy", "mint": "A", "traderPublicKey": "same"})
+    assert out is None
+    assert mon.pending["A"].unique_buyers == 1
+
+
+def test_curve_overflow_skips_permanently():
+    skips: list = []
+    mon = make_monitor(skips)
+    mon.handle_event(
+        {"txType": "create", "mint": "A", "name": "n", "image": "i",
+         "timestamp": (time.time() - 300) * 1000}
+    )
+    mon.handle_event(
+        {"txType": "buy", "mint": "A", "traderPublicKey": "w1",
+         "vSolInBondingCurve": CURVE_COMPLETION_SOL * 0.9}
+    )
+    assert "A" not in mon.pending
+    assert skips == [("A", "curve_too_full")]
+
+
+def test_sweep_drops_stale_launches():
+    skips: list = []
+    mon = make_monitor(skips)
+    mon.handle_event(
+        {"txType": "create", "mint": "A", "name": "n", "image": "i",
+         "timestamp": (time.time() - 5000) * 1000}
+    )
+    ready = mon.sweep()
+    assert ready == []
+    assert skips == [("A", "stale_no_traction")]
+    assert mon.pending == {}
+
+
+def test_sweep_emits_matured_token():
+    skips: list = []
+    mon = make_monitor(skips)
+    mon.handle_event(
+        {"txType": "create", "mint": "A", "name": "n", "image": "i",
+         "timestamp": (time.time() - 300) * 1000}
+    )
+    for wallet in ("w1", "w2", "w3", "w4"):
+        mon.handle_event({"txType": "buy", "mint": "A", "traderPublicKey": wallet})
+    # уже отдан на последней покупке, повторно не отдаётся
+    assert mon.sweep() == []
