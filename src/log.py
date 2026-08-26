@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import time
 from collections.abc import Iterator
@@ -39,16 +40,57 @@ def setup_logging(config: Config) -> None:
 class TradeLog:
     """Аппендер JSONL. Каждая запись флашится сразу — процесс может умереть."""
 
-    def __init__(self, path: str | Path, mode: str = "dry-run") -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        mode: str = "dry-run",
+        max_bytes: int = 0,
+        backups: int = 5,
+    ) -> None:
         self.path = Path(path)
         self.mode = mode
+        self.max_bytes = max(0, max_bytes)
+        self.backups = max(1, backups)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def from_config(cls, config: Any) -> TradeLog:
+        return cls(
+            config.logging.path,
+            mode=config.mode,
+            max_bytes=config.logging.max_bytes,
+            backups=config.logging.backups,
+        )
+
+    # -- ротация -----------------------------------------------------------
+
+    def rotate_if_needed(self) -> bool:
+        """Отрезать файл, когда он перерос порог. Реплей читает и .1, и .2.
+
+        Без этого JSONL за месяц непрерывной работы вырастает до размера,
+        который уже не открыть, и место кончается молча.
+        """
+        if not self.max_bytes or not self.path.exists():
+            return False
+        if self.path.stat().st_size < self.max_bytes:
+            return False
+
+        oldest = self.path.with_suffix(self.path.suffix + f".{self.backups}")
+        oldest.unlink(missing_ok=True)
+        for index in range(self.backups - 1, 0, -1):
+            source = self.path.with_suffix(self.path.suffix + f".{index}")
+            if source.exists():
+                os.replace(source, self.path.with_suffix(self.path.suffix + f".{index + 1}"))
+        os.replace(self.path, self.path.with_suffix(self.path.suffix + ".1"))
+        log.info("лог %s достиг %d байт — повёрнут", self.path, self.max_bytes)
+        return True
 
     # -- запись ------------------------------------------------------------
 
     def _write(self, record: dict[str, Any]) -> dict[str, Any]:
         record.setdefault("ts", time.time())
         record.setdefault("mode", self.mode)
+        self.rotate_if_needed()
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
         return record
@@ -142,6 +184,12 @@ class TradeLog:
     # -- чтение ------------------------------------------------------------
 
     def read(self) -> Iterator[dict[str, Any]]:
+        yield from read_log(self.path)
+
+    def read_all(self) -> Iterator[dict[str, Any]]:
+        """Текущий файл вместе с повёрнутыми копиями, от старых к новым."""
+        for index in range(self.backups, 0, -1):
+            yield from read_log(self.path.with_suffix(self.path.suffix + f".{index}"))
         yield from read_log(self.path)
 
 

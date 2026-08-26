@@ -49,8 +49,13 @@ class TimingAgent(GrokAgent):
     prompt: ClassVar[str] = TIMING_PROMPT
     result_model: ClassVar[type] = TimingResult
 
-    def __init__(self, config: Config, client: Any | None = None) -> None:
-        super().__init__(config, client)
+    def __init__(
+        self,
+        config: Config,
+        client: Any | None = None,
+        ops: Any | None = None,
+    ) -> None:
+        super().__init__(config, client, ops)
         self.cache_seconds = config.scoring.timing_cache_seconds
         self._cached: TimingResult | None = None
         self._lock = asyncio.Lock()

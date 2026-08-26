@@ -206,3 +206,33 @@ def test_sweep_emits_matured_token():
         mon.handle_event({"txType": "buy", "mint": "A", "traderPublicKey": wallet})
     # уже отдан на последней покупке, повторно не отдаётся
     assert mon.sweep() == []
+
+
+# --- память монитора ------------------------------------------------------
+
+
+def test_seen_set_forgets_oldest():
+    """Процесс живёт сутками: список виденных минтов не должен расти вечно."""
+    from src.monitor import SeenSet
+
+    seen = SeenSet(maxlen=3)
+    for mint in ("A", "B", "C", "D"):
+        seen.add(mint)
+    assert len(seen) == 3
+    assert "A" not in seen
+    assert "D" in seen
+
+
+def test_pending_buffer_is_bounded(monkeypatch):
+    import src.monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "MAX_PENDING", 3)
+    skips: list = []
+    mon = make_monitor(skips)
+    for index in range(5):
+        mon.handle_event({
+            "txType": "create", "mint": f"M{index}", "name": "n", "image": "i",
+            "timestamp": (time.time() - 1000 + index) * 1000,
+        })
+    assert len(mon.pending) <= 3
+    assert skips and skips[0][1] == "buffer_overflow"

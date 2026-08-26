@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.log import read_log  # noqa: E402
+from src.log import TradeLog, read_log  # noqa: E402
 
 BUCKETS = [(0.0, 0.5), (0.5, 0.6), (0.6, 0.7), (0.7, 0.8), (0.8, 0.9), (0.9, 1.01)]
 
@@ -44,10 +44,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Сводка по логу пайплайна")
     parser.add_argument("log", nargs="?", default="logs/trades.jsonl")
     parser.add_argument("--since", help="YYYY-MM-DD, только записи с этой даты")
+    parser.add_argument("--rotated", action="store_true",
+                        help="считать вместе с повёрнутыми копиями (.1, .2, ...)")
     args = parser.parse_args()
 
     since = parse_since(args.since)
-    records = [r for r in read_log(args.log) if r.get("ts", 0) >= since]
+    source = TradeLog(args.log).read_all() if args.rotated else read_log(args.log)
+    records = [r for r in source if r.get("ts", 0) >= since]
     if not records:
         print(f"В {args.log} нет записей" + (f" с {args.since}" if args.since else ""))
         return 1

@@ -16,6 +16,7 @@ import contextlib
 import json
 import logging
 import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
@@ -30,6 +31,31 @@ CURVE_COMPLETION_SOL = 85.0
 
 # Сколько держать лонч в буфере, если он так и не набрал покупателей.
 PENDING_TTL_SECONDS = 900.0
+
+# Потолки памяти. Процесс живёт сутками, а лончей на pump.fun тысячи в час:
+# без ограничения и буфер, и список уже виденных растут без конца.
+MAX_PENDING = 2_000
+MAX_REMEMBERED = 20_000
+
+
+class SeenSet:
+    """Множество последних N ключей. Старые вытесняются, память не течёт."""
+
+    def __init__(self, maxlen: int = MAX_REMEMBERED) -> None:
+        self.maxlen = maxlen
+        self._items: OrderedDict[str, None] = OrderedDict()
+
+    def add(self, key: str) -> None:
+        self._items[key] = None
+        self._items.move_to_end(key)
+        while len(self._items) > self.maxlen:
+            self._items.popitem(last=False)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._items
+
+    def __len__(self) -> int:
+        return len(self._items)
 
 
 def parse_create_event(payload: dict[str, Any]) -> Token | None:
@@ -94,7 +120,7 @@ class LaunchMonitor:
         self.on_skip = on_skip
         self.pending: dict[str, Token] = {}
         self._buyers: dict[str, set[str]] = {}
-        self._emitted: set[str] = set()
+        self._emitted = SeenSet()
 
     # -- обработка событий -------------------------------------------------
 
@@ -105,6 +131,7 @@ class LaunchMonitor:
         if tx_type in ("create", "created"):
             token = parse_create_event(payload)
             if token and token.mint not in self._emitted:
+                self._evict_if_crowded()
                 self.pending[token.mint] = token
                 # Создателя в покупатели не записываем: нужен счётчик
                 # посторонних кошельков, а не всех подряд.
@@ -165,6 +192,16 @@ class LaunchMonitor:
     def _forget(self, mint: str) -> None:
         self.pending.pop(mint, None)
         self._buyers.pop(mint, None)
+
+    def _evict_if_crowded(self) -> None:
+        """Буфер переполнен — выкидываем самые старые недозревшие лончи."""
+        while len(self.pending) >= MAX_PENDING:
+            oldest = min(self.pending, key=lambda mint: self.pending[mint].created_timestamp)
+            token = self.pending[oldest]
+            self._forget(oldest)
+            self._emitted.add(oldest)
+            if self.on_skip:
+                self.on_skip(token, "buffer_overflow")
 
     # -- сокет -------------------------------------------------------------
 

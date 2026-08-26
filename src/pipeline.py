@@ -8,8 +8,13 @@
 доходит только то, что пережило фильтр кодом, метрики, трёх быстрых
 агентов и скоринговый порог.
 
+Процесс рассчитан на то, чтобы жить сутками: состояние переживает
+рестарт, SIGTERM останавливает аккуратно, расход Grok ограничен, живость
+видна снаружи через /healthz.
+
 Запуск:
     python -m src.pipeline --config config.yaml
+    python -m src.pipeline --config config.yaml --check          # только проверить
     python -m src.pipeline --config config.yaml --i-understand-the-risk   # для live
 """
 
@@ -17,8 +22,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -28,38 +35,65 @@ from .agents import AuditorAgent, CheckerAgent, NarrativeAgent, TimingAgent
 from .analyzer import Analyzer, compute_metrics, enrich_token
 from .executor import BaseExecutor, build_executor, new_position
 from .log import TradeLog, setup_logging
-from .models import Analysis, Config, Position, Token
+from .models import Analysis, Config, ConfigError, Position, Token
 from .monitor import LaunchMonitor
+from .ops import (
+    GrokOps,
+    Heartbeat,
+    HealthServer,
+    Metrics,
+    cancel_and_wait,
+    drain,
+    install_signal_handlers,
+)
 from .risk import RiskManager, StopLossWatcher
 from .scoring import compute_scores, passes_threshold, weakest_component
+from .state import StateStore
 
 log = logging.getLogger("pipeline")
 
 # Сколько токенов разбираем одновременно. Больше — упрёмся в лимиты Grok.
 MAX_CONCURRENT_TOKENS = 4
 
+# Столько без единого события из сокета — считаем поток застрявшим и
+# сообщаем об этом в /healthz. Лончи на pump.fun идут непрерывно.
+STALL_SECONDS = 600.0
+
 
 class Pipeline:
     """Держит агентов, состояние риска и лог; гоняет токены по ступеням."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, store: StateStore | None = None) -> None:
         self.config = config
-        self.trade_log = TradeLog(config.logging.path, mode=config.mode)
-        self.risk = RiskManager(config)
+        self.metrics = Metrics()
+        self.trade_log = TradeLog.from_config(config)
+        self.store = store if store is not None else StateStore(config.ops.state_path)
+        self.risk = RiskManager(config, store=self.store)
+        self.grok_ops = GrokOps(config, self.metrics)
 
-        self._grok_client = httpx.AsyncClient(timeout=config.grok.timeout_seconds)
-        self.auditor = AuditorAgent(config, self._grok_client)
-        self.narrative = NarrativeAgent(config, self._grok_client)
-        self.timing = TimingAgent(config, self._grok_client)
-        self.checker = CheckerAgent(config, self._grok_client)
+        self._grok_client = httpx.AsyncClient(
+            timeout=config.grok.timeout_seconds,
+            limits=httpx.Limits(max_connections=config.ops.grok_max_concurrency * 2),
+        )
+        self.auditor = AuditorAgent(config, self._grok_client, self.grok_ops)
+        self.narrative = NarrativeAgent(config, self._grok_client, self.grok_ops)
+        self.timing = TimingAgent(config, self._grok_client, self.grok_ops)
+        self.checker = CheckerAgent(config, self._grok_client, self.grok_ops)
 
         self.analyzer = Analyzer(config)
         self.executor: BaseExecutor = build_executor(config)
         self.monitor = LaunchMonitor(config, on_skip=self._log_monitor_skip)
         self.watcher = StopLossWatcher(self.risk, self._price, self._sell)
+        self.health = HealthServer(
+            config.ops.health_host, config.ops.health_port, self.status, self.metrics
+        )
+        self.heartbeat = Heartbeat(config.ops.heartbeat_seconds, self.status)
 
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_TOKENS)
         self._tasks: set[asyncio.Task] = set()
+        self._stopping = asyncio.Event()
+        self._started_at = time.time()
+        self._last_event_at = time.time()
 
     # -- жизненный цикл ----------------------------------------------------
 
@@ -70,6 +104,8 @@ class Pipeline:
 
     async def __aexit__(self, *exc: Any) -> None:
         await self.watcher.stop()
+        await self.heartbeat.stop()
+        await self.health.stop()
         for task in list(self._tasks):
             task.cancel()
         if self._tasks:
@@ -78,13 +114,71 @@ class Pipeline:
         await self.executor.__aexit__(*exc)
         await self._grok_client.aclose()
 
-    async def run(self) -> None:
-        """Главный цикл. Живёт, пока не отменят."""
+    def restore(self) -> None:
+        """Поднять состояние прошлого запуска: позиции и лимиты дня."""
+        if self.risk.restore():
+            # Бюджет вызовов Grok продолжается с того же места, иначе
+            # рестарт-петля выест дневной лимит за час.
+            self.grok_ops.budget.spent = self.risk.grok_calls_today
+            for mint, position in self.risk.positions.items():
+                log.info("позиция под присмотром после рестарта: %s, вход %.12f, %.4f SOL",
+                         mint[:8], position.entry_price, position.sol_spent)
+
+    async def serve(self) -> int:
+        """Полный жизненный цикл: старт, работа, аккуратная остановка."""
+        install_signal_handlers(self.request_stop)
+        self.restore()
+        await self.health.start()
         self.watcher.start()
-        log.info("пайплайн запущен, режим %s, лог %s",
-                 self.config.mode, self.config.logging.path)
+        self.heartbeat.start()
+        log.info("пайплайн запущен: %s", self.config.summary())
+
+        consumer = asyncio.create_task(self._consume(), name="monitor-consumer")
+        stopper = asyncio.create_task(self._stopping.wait(), name="stop-signal")
+        await asyncio.wait({consumer, stopper}, return_when=asyncio.FIRST_COMPLETED)
+
+        await cancel_and_wait(stopper)
+        await cancel_and_wait(consumer)
+        await self.shutdown()
+        return 0
+
+    def request_stop(self, reason: str = "stop") -> None:
+        """Вызывается обработчиком сигнала. Второй сигнал не ускоряет выход."""
+        if not self._stopping.is_set():
+            log.info("получен %s — останавливаемся аккуратно", reason)
+            self._stopping.set()
+        else:
+            log.warning("%s повторно, уже останавливаемся", reason)
+
+    async def shutdown(self) -> None:
+        """Доделать начатое, сохранить состояние, закрыть соединения."""
+        done, cancelled = await drain(set(self._tasks), self.config.ops.shutdown_grace_seconds)
+        self._tasks.clear()
+        self._sync_counters()
+        self.risk.persist()
+        await self.watcher.stop()
+        await self.heartbeat.stop()
+        await self.health.stop()
+        log.info(
+            "остановлено: доделано %d, снято %d, открытых позиций %d, "
+            "сделок за день %d, PnL %+.4f SOL, вызовов Grok %d",
+            done, cancelled, self.risk.open_count, self.risk.trades_today,
+            self.risk.realized_pnl_sol, self.grok_ops.budget.spent,
+        )
+        if self.risk.positions:
+            log.warning("позиции остаются открытыми: %s — стоп-лосс не работает, "
+                        "пока процесс не поднят снова",
+                        ", ".join(m[:8] for m in self.risk.positions))
+
+    async def _consume(self) -> None:
+        """Читать поток монитора и раздавать токены в обработку."""
         async for token in self.monitor.stream():
+            self._last_event_at = time.time()
+            self.metrics.inc("tokens_seen")
+            if self._stopping.is_set():
+                break
             if self.risk.halted:
+                self.metrics.inc("skip_risk_halted")
                 self.trade_log.skip(token, stage="risk", reason="daily_loss_limit_hit")
                 continue
             task = asyncio.create_task(self._guarded(token), name=f"token-{token.mint[:8]}")
@@ -99,6 +193,7 @@ class Pipeline:
                 raise
             except Exception as exc:
                 log.exception("токен %s уронил обработку: %s", token.mint, exc)
+                self.metrics.inc("errors")
                 self.trade_log.skip(token, stage="pipeline", reason="internal_error", detail=str(exc))
 
     # -- ступени -----------------------------------------------------------
@@ -116,9 +211,8 @@ class Pipeline:
 
         ok, reason = self.analyzer.passes(metrics)
         if not ok:
-            self.trade_log.skip(token, stage="analyzer", reason=reason,
+            return self._reject(analysis, stage="analyzer", reason=reason,
                                 detail=f"risk_score={metrics.risk_score}")
-            return None
 
         # 3-5. Быстрые агенты параллельно. Тайминг обычно берётся из кэша.
         analysis.audit, analysis.narrative, analysis.timing = await asyncio.gather(
@@ -132,45 +226,90 @@ class Pipeline:
         ok, reason = passes_threshold(analysis.scores, self.config)
         if not ok:
             name, value = weakest_component(analysis.scores)
-            self.trade_log.skip(token, stage="scoring", reason=reason,
-                                detail=f"слабее всего {name}={value:.3f}",
-                                scores=analysis.scores)
-            return None
+            return self._reject(analysis, stage="scoring", reason=reason,
+                                detail=f"слабее всего {name}={value:.3f}")
 
         # 7. Адверсариальный чекер на сильной модели.
         analysis.checker = await self.checker.run(analysis)
         if not analysis.checker.approve:
-            self.trade_log.skip(token, stage="checker",
-                                reason="checker_rejected",
-                                detail=f"{analysis.checker.reason} "
-                                       f"[{', '.join(analysis.checker.flags)}]",
-                                scores=analysis.scores)
-            return None
+            return self._reject(
+                analysis, stage="checker", reason="checker_rejected",
+                detail=f"{analysis.checker.reason} [{', '.join(analysis.checker.flags)}]",
+            )
 
         # 8. Риск-гейт.
         decision = self.risk.evaluate(token.mint, analysis.scores.total)
         if not decision.approved:
-            self.trade_log.skip(token, stage="risk", reason=decision.reason,
-                                scores=analysis.scores)
-            return None
+            return self._reject(analysis, stage="risk", reason=decision.reason)
 
         # 9. Исполнение.
-        result = await self.executor.buy(token, decision.size_sol)
+        self._sync_counters()
+        try:
+            result = await self.executor.buy(token, decision.size_sol)
+        except NotImplementedError as exc:
+            # Live-исполнитель — заглушка по замыслу: об этом надо кричать,
+            # а не глотать как обычную ошибку ступени.
+            log.error("исполнение не реализовано: %s", exc)
+            return self._reject(analysis, stage="executor", reason="executor_not_implemented",
+                                detail=str(exc))
         if not result.ok:
-            self.trade_log.skip(token, stage="executor", reason="execution_failed",
-                                detail=result.error, scores=analysis.scores)
-            return None
+            return self._reject(analysis, stage="executor", reason="execution_failed",
+                                detail=result.error)
 
         position = new_position(token, result, analysis.scores.total)
+        self._sync_counters()
         self.risk.register_open(position)
         self.trade_log.buy(analysis, size_sol=decision.size_sol,
                            entry_price=result.price, tx_hash=result.tx_hash)
+        self.metrics.inc("buys")
+        self.metrics.gauge("open_positions", self.risk.open_count)
         log.info("КУПЛЕНО %s на %.4f SOL, score %.3f, tx %s",
                  token.symbol or token.mint[:8], decision.size_sol,
                  analysis.scores.total, result.tx_hash)
         return analysis
 
-    # -- вспомогательное ---------------------------------------------------
+    def _reject(
+        self, analysis: Analysis, *, stage: str, reason: str, detail: str | None = None
+    ) -> None:
+        """Отказ на ступени: метрика, запись в лог, конец разбора."""
+        self.metrics.inc(f"skip_{stage}")
+        self.trade_log.skip(
+            analysis.token, stage=stage, reason=reason, detail=detail,
+            scores=analysis.scores if analysis.scores.total else None,
+        )
+        return None
+
+    # -- состояние и наблюдаемость ----------------------------------------
+
+    def _sync_counters(self) -> None:
+        """Перенести расход Grok в состояние, которое ляжет на диск."""
+        self.risk.grok_calls_today = self.grok_ops.budget.spent
+
+    def status(self) -> dict[str, Any]:
+        """Снимок для /healthz и heartbeat. Ничего секретного не содержит."""
+        stalled = (time.time() - self._last_event_at) > STALL_SECONDS
+        breaker = self.grok_ops.breaker.state
+        if breaker == "open" or stalled:
+            state = "degraded"
+        else:
+            state = "ok"
+        return {
+            "status": state,
+            "mode": self.config.mode,
+            "uptime_seconds": round(self.metrics.uptime_seconds, 1),
+            "stalled": stalled,
+            "seconds_since_event": round(time.time() - self._last_event_at, 1),
+            "in_flight": len(self._tasks),
+            "pending_launches": len(self.monitor.pending),
+            "open_positions": self.risk.open_count,
+            "trades_today": self.risk.trades_today,
+            "realized_pnl_sol": round(self.risk.realized_pnl_sol, 6),
+            "halted": self.risk.halted,
+            "breaker": breaker,
+            "grok_budget_remaining": self.grok_ops.budget.remaining,
+            "grok_tokens_in": self.grok_ops.tokens_in,
+            "grok_tokens_out": self.grok_ops.tokens_out,
+        }
 
     def _market_snapshot(self) -> dict[str, Any]:
         """Что пайплайн знает о рынке сам — уходит тайминг-агенту как контекст."""
@@ -182,6 +321,7 @@ class Pipeline:
         }
 
     def _log_monitor_skip(self, token: Token, reason: str) -> None:
+        self.metrics.inc("skip_monitor")
         self.trade_log.skip(token, stage="monitor", reason=reason)
 
     async def _price(self, mint: str) -> float:
@@ -189,12 +329,21 @@ class Pipeline:
 
     async def _sell(self, position: Position, price: float) -> None:
         """Продажа по стоп-лоссу: закрыть, посчитать PnL, записать в лог."""
-        result = await self.executor.sell(position)
+        try:
+            result = await self.executor.sell(position)
+        except NotImplementedError as exc:
+            log.error("продажа не реализована, позиция %s остаётся открытой: %s",
+                      position.mint[:8], exc)
+            self.metrics.inc("sell_not_implemented")
+            return
         proceeds = result.sol_amount if result.ok else position.token_amount * price
         pnl = proceeds - position.sol_spent
+        self._sync_counters()
         self.risk.register_close(position.mint, pnl_sol=pnl)
         self.trade_log.close(position, exit_price=result.price or price,
                              pnl_sol=pnl, reason="stop_loss", tx_hash=result.tx_hash)
+        self.metrics.inc("closes")
+        self.metrics.gauge("open_positions", self.risk.open_count)
         log.info("ЗАКРЫТО %s по стоп-лоссу, PnL %+.4f SOL", position.mint[:8], pnl)
 
 
@@ -220,16 +369,31 @@ LIVE_WARNING = """
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="grokbot-pumpfun")
     parser.add_argument("--config", default="config.yaml", help="путь к конфигу")
+    parser.add_argument("--check", action="store_true",
+                        help="проверить конфиг и выйти, ничего не запуская")
     parser.add_argument("--i-understand-the-risk", action="store_true",
                         help="обязателен для запуска в режиме live")
     return parser.parse_args(argv)
 
 
 def load_and_check(args: argparse.Namespace) -> Config:
+    """Прочитать конфиг, проверить пригодность, объяснить отказ по-человечески."""
     path = Path(args.config)
     if not path.exists():
         raise SystemExit(f"Конфига {path} нет. Скопируйте config.example.yaml в config.yaml.")
-    config = Config.load(path)
+
+    try:
+        config = Config.load(path)
+    except Exception as exc:
+        raise SystemExit(f"Конфиг {path} не читается: {exc}") from exc
+
+    try:
+        warnings = config.check_ready()
+    except ConfigError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    for warning in warnings:
+        print(f"ВНИМАНИЕ: {warning}", file=sys.stderr)
 
     if config.is_live:
         print(LIVE_WARNING.format(
@@ -245,20 +409,23 @@ def load_and_check(args: argparse.Namespace) -> Config:
 
 
 async def amain(argv: list[str] | None = None) -> int:
-    config = load_and_check(parse_args(argv))
+    args = parse_args(argv)
+    config = load_and_check(args)
     setup_logging(config)
+
+    if args.check:
+        print(json.dumps(config.redacted(), ensure_ascii=False, indent=2))
+        print("\nКонфиг пригоден для запуска.", file=sys.stderr)
+        return 0
+
     async with Pipeline(config) as pipeline:
-        try:
-            await pipeline.run()
-        except asyncio.CancelledError:
-            pass
-    return 0
+        return await pipeline.serve()
 
 
 def main(argv: list[str] | None = None) -> int:
     try:
         return asyncio.run(amain(argv))
-    except KeyboardInterrupt:
+    except KeyboardInterrupt:            # если сигнал пришёл до установки обработчиков
         print("\nостановлено", file=sys.stderr)
         return 130
 

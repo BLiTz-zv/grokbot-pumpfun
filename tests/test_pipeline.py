@@ -5,6 +5,7 @@
 транзакция не отправляется.
 """
 
+import asyncio
 import json
 import time
 
@@ -13,7 +14,8 @@ import pytest
 
 from src.log import read_log
 from src.models import Config, Token
-from src.pipeline import Pipeline, load_and_check, parse_args
+from src.pipeline import Pipeline, load_and_check, main, parse_args
+from src.state import StateStore
 
 
 def grok_handler(responses: dict[str, str]):
@@ -75,11 +77,27 @@ def data_handler(request: httpx.Request) -> httpx.Response:
 def config(tmp_path) -> Config:
     cfg = Config()
     cfg.mode = "dry-run"
-    cfg.grok.api_key = "test"
+    cfg.grok.api_key = "xai-test-key-1234567890"
     cfg.grok.retry_base_delay = 0.0
     cfg.logging.path = str(tmp_path / "trades.jsonl")
+    cfg.ops.state_path = str(tmp_path / "state.json")
     cfg.filter.min_total_score = 0.65
     return cfg
+
+
+LIVE_YAML = """
+mode: live
+grok:
+  api_key: xai-настоящий-ключ-1234
+solana:
+  wallet_private_key: 5xНастоящийКлюч
+"""
+
+DRY_YAML = """
+mode: dry-run
+grok:
+  api_key: xai-настоящий-ключ-1234
+"""
 
 
 def wire(pipeline: Pipeline, checker_answer: str) -> None:
@@ -181,12 +199,113 @@ async def test_stop_loss_closes_position_and_logs_pnl(config):
     assert closes[0]["tx_hash"] == "dry_run"
 
 
+# --- рестарт и остановка --------------------------------------------------
+
+
+async def test_restart_picks_up_open_position(config):
+    """Поднятый заново процесс не покупает то же самое второй раз."""
+    first = Pipeline(config)
+    wire(first, APPROVE)
+    await first.process(fresh_token())
+    assert first.risk.open_count == 1
+
+    second = Pipeline(config)
+    wire(second, APPROVE)
+    second.restore()
+    assert second.risk.open_count == 1
+    assert await second.process(fresh_token()) is None
+
+    records = list(read_log(config.logging.path))
+    assert records[-1]["stage"] == "risk"
+    assert records[-1]["reason"] == "already_open"
+
+
+async def test_restart_continues_grok_budget(config):
+    """Иначе петля рестартов выест дневной бюджет вызовов за час."""
+    first = Pipeline(config)
+    wire(first, APPROVE)
+    await first.process(fresh_token())
+    spent = first.grok_ops.budget.spent
+    assert spent >= 4                      # аудитор, нарратив, тайминг, чекер
+    await first.shutdown()
+
+    second = Pipeline(config)
+    second.restore()
+    assert second.grok_ops.budget.spent == spent
+
+
+async def test_shutdown_persists_state(config):
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    await pipeline.process(fresh_token())
+    await pipeline.shutdown()
+
+    saved = StateStore(config.ops.state_path).load()
+    assert saved is not None
+    assert "Mint1111" in saved.positions
+    assert saved.trades_today == 1
+
+
+async def test_stop_request_is_idempotent(config):
+    pipeline = Pipeline(config)
+    pipeline.request_stop("SIGTERM")
+    pipeline.request_stop("SIGTERM")
+    assert pipeline._stopping.is_set()
+
+
+async def test_shutdown_finishes_work_in_flight(config):
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    task = asyncio.create_task(pipeline.process(fresh_token()))
+    pipeline._tasks.add(task)
+    await pipeline.shutdown()
+    assert task.done()
+    assert pipeline.risk.open_count == 1
+
+
+# --- наблюдаемость --------------------------------------------------------
+
+
+async def test_status_is_ok_and_free_of_secrets(config):
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    await pipeline.process(fresh_token())
+    status = pipeline.status()
+    assert status["status"] == "ok"
+    assert status["open_positions"] == 1
+    assert status["trades_today"] == 1
+    assert config.grok.key not in json.dumps(status, ensure_ascii=False)
+
+
+async def test_status_degrades_when_breaker_opens(config):
+    config.ops.breaker_failures = 1
+    pipeline = Pipeline(config)
+    pipeline.grok_ops.breaker.record_failure()
+    assert pipeline.status()["status"] == "degraded"
+
+
+async def test_status_degrades_when_stream_stalls(config):
+    pipeline = Pipeline(config)
+    pipeline._last_event_at -= 10_000
+    status = pipeline.status()
+    assert status["stalled"]
+    assert status["status"] == "degraded"
+
+
+async def test_metrics_count_stages(config):
+    pipeline = Pipeline(config)
+    wire(pipeline, REJECT)
+    await pipeline.process(fresh_token())
+    assert pipeline.metrics.counters["skip_checker"] == 1
+    assert pipeline.metrics.counters["grok_ok_checker"] == 1
+
+
 # --- защита режима live ---------------------------------------------------
 
 
 def test_live_without_flag_refuses(tmp_path):
     cfg = tmp_path / "config.yaml"
-    cfg.write_text("mode: live\n")
+    cfg.write_text(LIVE_YAML)
     with pytest.raises(SystemExit) as exc:
         load_and_check(parse_args(["--config", str(cfg)]))
     assert "--i-understand-the-risk" in str(exc.value)
@@ -194,7 +313,7 @@ def test_live_without_flag_refuses(tmp_path):
 
 def test_live_with_flag_allowed(tmp_path):
     cfg = tmp_path / "config.yaml"
-    cfg.write_text("mode: live\n")
+    cfg.write_text(LIVE_YAML)
     config = load_and_check(parse_args(["--config", str(cfg), "--i-understand-the-risk"]))
     assert config.is_live
 
@@ -204,7 +323,48 @@ def test_missing_config_refuses(tmp_path):
         load_and_check(parse_args(["--config", str(tmp_path / "нет.yaml")]))
 
 
+def test_broken_yaml_refuses(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("mode: [не закрыт\n")
+    with pytest.raises(SystemExit) as exc:
+        load_and_check(parse_args(["--config", str(cfg)]))
+    assert "не читается" in str(exc.value)
+
+
+def test_invalid_config_refuses_before_start(tmp_path):
+    """Плохой конфиг должен падать на запуске, а не через час торговли."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(DRY_YAML + "risk:\n  max_sol_per_trade: 0\n")
+    with pytest.raises(SystemExit) as exc:
+        load_and_check(parse_args(["--config", str(cfg)]))
+    assert "max_sol_per_trade" in str(exc.value)
+
+
 def test_dry_run_needs_no_flag(tmp_path):
     cfg = tmp_path / "config.yaml"
-    cfg.write_text("mode: dry-run\n")
+    cfg.write_text(DRY_YAML)
     assert not load_and_check(parse_args(["--config", str(cfg)])).is_live
+
+
+def test_check_flag_exits_without_running(tmp_path, capsys):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(DRY_YAML)
+    assert main(["--config", str(cfg), "--check"]) == 0
+    printed = capsys.readouterr().out
+    assert "xai-настоящий-ключ-1234" not in printed
+    assert "dry-run" in printed
+
+
+async def test_live_executor_stub_does_not_crash_the_pipeline(config):
+    """Заглушка live поднимает NotImplementedError — это отказ ступени с
+    громкой записью в лог, а не падение процесса и не тихая покупка."""
+    config.mode = "live"
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    assert pipeline.executor.__class__.__name__ == "LiveExecutor"
+
+    assert await pipeline.process(fresh_token()) is None
+    assert pipeline.risk.open_count == 0
+    records = list(read_log(config.logging.path))
+    assert records[-1]["stage"] == "executor"
+    assert records[-1]["reason"] == "executor_not_implemented"
