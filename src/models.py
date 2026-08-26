@@ -354,6 +354,18 @@ class ScoringConfig(BaseModel):
     timing_cache_seconds: float = 900.0
 
 
+class AlertsConfig(SecretModel):
+    """Уведомления наружу. Пустой webhook_url — выключено."""
+
+    # В URL обычно зашит токен, поэтому это секрет, а не строка.
+    webhook_url: SecretStr = SecretStr("")
+    events: list[str] = Field(
+        default_factory=lambda: ["started", "buy", "close", "rug", "breaker", "halted"]
+    )
+    timeout_seconds: float = 10.0
+    max_per_minute: int = 20
+
+
 class LoggingConfig(BaseModel):
     path: str = "logs/trades.jsonl"
     level: str = "INFO"
@@ -396,7 +408,14 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "GROKBOT_LOG_LEVEL": ("logging", "level"),
     "GROKBOT_STATE_PATH": ("ops", "state_path"),
     "GROKBOT_HEALTH_PORT": ("ops", "health_port"),
+    "GROKBOT_ALERT_WEBHOOK": ("alerts", "webhook_url"),
 }
+
+
+# События, которые пайплайн умеет отправлять в webhook.
+ALERT_EVENTS = frozenset(
+    {"started", "stopped", "buy", "close", "rug", "breaker", "halted", "stalled"}
+)
 
 
 class ConfigError(RuntimeError):
@@ -439,6 +458,7 @@ class Config(BaseModel):
     filter: FilterConfig = Field(default_factory=FilterConfig)
     scoring: ScoringConfig = Field(default_factory=ScoringConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    alerts: AlertsConfig = Field(default_factory=AlertsConfig)
     ops: OpsConfig = Field(default_factory=OpsConfig)
 
     @property
@@ -532,6 +552,15 @@ class Config(BaseModel):
         if sum(max(0.0, w) for w in weights.model_dump().values()) <= 0:
             errors.append("все веса scoring.weights нулевые или отрицательные")
 
+        unknown = [e for e in self.alerts.events if e not in ALERT_EVENTS]
+        if unknown:
+            errors.append(
+                f"alerts.events: неизвестные события {unknown}; "
+                f"допустимы {sorted(ALERT_EVENTS)}"
+            )
+        if self.alerts.max_per_minute < 1:
+            errors.append("alerts.max_per_minute должен быть не меньше 1")
+
         if self.ops.max_grok_calls_per_day < 1:
             errors.append("ops.max_grok_calls_per_day должен быть не меньше 1")
         if self.ops.grok_max_concurrency < 1:
@@ -577,6 +606,7 @@ class Config(BaseModel):
         data["grok"]["api_key"] = mask(self.grok.key)
         data["data"]["api_key"] = mask(self.data.key)
         data["solana"]["wallet_private_key"] = mask(self.solana.wallet_key)
+        data["alerts"]["webhook_url"] = mask(self.alerts.webhook_url.get_secret_value())
         return data
 
     def summary(self) -> str:

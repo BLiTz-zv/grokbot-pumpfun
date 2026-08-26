@@ -525,3 +525,107 @@ async def test_reputation_can_be_switched_off(config):
     другой = fresh_token()
     другой.mint = "Mint5555"
     assert await pipeline.process(другой) is not None      # куплен, несмотря на слив
+
+
+# --- уведомления ----------------------------------------------------------
+
+
+def wire_alerts(pipeline: Pipeline) -> list[dict]:
+    """Включить уведомления и собирать их в список вместо сети."""
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    pipeline.config.alerts.webhook_url = "https://hooks.example/тест"
+    pipeline.notifier.config = pipeline.config.alerts
+    pipeline.notifier._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    pipeline.notifier._owns_client = False   # мок переживает aclose между проверками
+    return seen
+
+
+async def flush_alerts(pipeline: Pipeline) -> None:
+    """Дождаться отправки: notify кладёт задачу в фон и возвращает управление."""
+    await pipeline.notifier.aclose()
+
+
+async def test_buy_is_announced(config):
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    seen = wire_alerts(pipeline)
+    await pipeline.process(fresh_token())
+    await pipeline.notifier.aclose()
+
+    buys = [event for event in seen if event["event"] == "buy"]
+    assert len(buys) == 1
+    assert "CAT" in buys[0]["text"]
+    assert buys[0]["fields"]["mint"] == "Mint1111"
+
+
+async def test_rug_is_announced_separately_from_close(config):
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    seen = wire_alerts(pipeline)
+    await pipeline.process(fresh_token())
+    position = pipeline.risk.positions["Mint1111"]
+
+    crash_price(0.05)
+    await pipeline._sell(position, price=await pipeline._price(position.mint),
+                         reason="stop_loss")
+    await pipeline.notifier.aclose()
+
+    kinds = [event["event"] for event in seen]
+    assert kinds.count("close") == 1
+    assert kinds.count("rug") == 1
+    assert "отсекаются" in next(e for e in seen if e["event"] == "rug")["text"]
+
+
+async def test_ordinary_loss_is_not_announced_as_rug(config):
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    seen = wire_alerts(pipeline)
+    await pipeline.process(fresh_token())
+    position = pipeline.risk.positions["Mint1111"]
+
+    crash_price(0.8)
+    await pipeline._sell(position, price=await pipeline._price(position.mint),
+                         reason="stop_loss")
+    await pipeline.notifier.aclose()
+    assert "rug" not in [event["event"] for event in seen]
+
+
+async def test_breaker_announced_once_per_transition(config):
+    config.ops.breaker_failures = 1
+    pipeline = Pipeline(config)
+    seen = wire_alerts(pipeline)
+
+    pipeline.grok_ops.breaker.record_failure()
+    pipeline._check_transitions()
+    pipeline._check_transitions()                  # второй раз молчим
+    await flush_alerts(pipeline)
+    breaker_events = [e for e in seen if e["event"] == "breaker"]
+    assert len(breaker_events) == 1
+    assert "разомкнута" in breaker_events[0]["text"]
+
+    pipeline.grok_ops.breaker.record_success()
+    pipeline._check_transitions()
+    await flush_alerts(pipeline)
+    assert [e["text"] for e in seen if e["event"] == "breaker"][-1].endswith("продолжается")
+
+
+async def test_halt_is_announced(config):
+    pipeline = Pipeline(config)
+    seen = wire_alerts(pipeline)
+    pipeline.risk.register_close("X", pnl_sol=-config.risk.daily_loss_limit_sol)
+    pipeline._check_transitions()
+    await pipeline.notifier.aclose()
+    assert any(e["event"] == "halted" for e in seen)
+
+
+async def test_alerts_off_by_default(config):
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    assert not pipeline.notifier.enabled
+    await pipeline.process(fresh_token())          # ничего не шлётся и не падает
+    assert pipeline.notifier.snapshot() == {"sent": 0, "dropped": 0, "failed": 0}

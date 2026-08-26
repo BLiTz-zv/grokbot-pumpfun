@@ -76,6 +76,16 @@ logging:
   max_bytes: 50000000         # ротация JSONL при превышении, 0 — не ротировать
   backups: 5                  # сколько .1 .2 .3 хранить
 
+alerts:
+  # Пусто — уведомления выключены. Формат сообщения понимают Slack (text)
+  # и Discord (content); для Telegram нужен промежуточный релей.
+  # URL обычно содержит токен, поэтому его лучше задавать через
+  # переменную GROKBOT_ALERT_WEBHOOK, а не хранить в файле.
+  webhook_url: ""
+  events: ["started", "buy", "close", "rug", "breaker", "halted"]
+  timeout_seconds: 10
+  max_per_minute: 20          # лишнее выбрасывается, а не копится в очереди
+
 ops:
   state_path: "state/pipeline.json"   # позиции и счётчики дня, переживают рестарт
   reputation_path: "state/creators.json"  # память о создателях токенов

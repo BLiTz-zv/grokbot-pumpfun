@@ -32,6 +32,7 @@ from typing import Any
 import httpx
 
 from .agents import AuditorAgent, CheckerAgent, NarrativeAgent, TimingAgent
+from .alerts import Notifier
 from .analyzer import Analyzer, compute_metrics, enrich_token
 from .executor import BaseExecutor, build_executor, new_position
 from .log import TradeLog, setup_logging
@@ -71,6 +72,7 @@ class Pipeline:
         self.store = store if store is not None else StateStore(config.ops.state_path)
         self.risk = RiskManager(config, store=self.store)
         self.reputation = ReputationBook.load(config.ops.reputation_path)
+        self.notifier = Notifier(config.alerts)
         self.grok_ops = GrokOps(config, self.metrics)
 
         self._grok_client = httpx.AsyncClient(
@@ -89,13 +91,14 @@ class Pipeline:
         self.health = HealthServer(
             config.ops.health_host, config.ops.health_port, self.status, self.metrics
         )
-        self.heartbeat = Heartbeat(config.ops.heartbeat_seconds, self.status)
+        self.heartbeat = Heartbeat(config.ops.heartbeat_seconds, self._heartbeat_status)
 
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_TOKENS)
         self._tasks: set[asyncio.Task] = set()
         self._stopping = asyncio.Event()
         self._started_at = time.time()
         self._last_event_at = time.time()
+        self._alerted: dict[str, bool] = {"breaker": False, "halted": False, "stalled": False}
 
     # -- жизненный цикл ----------------------------------------------------
 
@@ -137,6 +140,10 @@ class Pipeline:
         self.watcher.start()
         self.heartbeat.start()
         log.info("пайплайн запущен: %s", self.config.summary())
+        self.notifier.notify(
+            "started", f"пайплайн запущен, режим {self.config.mode}",
+            open_positions=self.risk.open_count, mode=self.config.mode,
+        )
 
         consumer = asyncio.create_task(self._consume(), name="monitor-consumer")
         stopper = asyncio.create_task(self._stopping.wait(), name="stop-signal")
@@ -171,6 +178,13 @@ class Pipeline:
             done, cancelled, self.risk.open_count, self.risk.trades_today,
             self.risk.realized_pnl_sol, self.grok_ops.budget.spent,
         )
+        self.notifier.notify(
+            "stopped",
+            f"остановлен: открытых позиций {self.risk.open_count}, "
+            f"PnL за день {self.risk.realized_pnl_sol:+.4f} SOL",
+            open_positions=self.risk.open_count,
+        )
+        await self.notifier.aclose()
         if self.risk.positions:
             log.warning("позиции остаются открытыми: %s — стоп-лосс не работает, "
                         "пока процесс не поднят снова",
@@ -181,6 +195,7 @@ class Pipeline:
         async for token in self.monitor.stream():
             self._last_event_at = time.time()
             self.metrics.inc("tokens_seen")
+            self._check_transitions()
             if self._stopping.is_set():
                 break
             if self.risk.halted:
@@ -282,6 +297,13 @@ class Pipeline:
         log.info("КУПЛЕНО %s на %.4f SOL, score %.3f, tx %s",
                  token.symbol or token.mint[:8], decision.size_sol,
                  analysis.scores.total, result.tx_hash)
+        self.notifier.notify(
+            "buy",
+            f"куплен {token.symbol or token.mint[:8]} на {decision.size_sol:.4f} SOL, "
+            f"score {analysis.scores.total:.3f}",
+            mint=token.mint, size_sol=decision.size_sol,
+            score=analysis.scores.total, tx=result.tx_hash,
+        )
         return analysis
 
     def _reject(
@@ -296,6 +318,46 @@ class Pipeline:
         return None
 
     # -- состояние и наблюдаемость ----------------------------------------
+
+    def _heartbeat_status(self) -> dict[str, Any]:
+        """Снимок для heartbeat, попутно ловящий переходы.
+
+        Во время застоя событий из сокета нет, и другого повода заметить
+        его — тоже: heartbeat остаётся единственным тиком.
+        """
+        status = self.status()
+        self._check_transitions(status)
+        return status
+
+    def _check_transitions(self, status: dict[str, Any] | None = None) -> None:
+        """Отправить уведомление на смене состояния, а не на каждом тике."""
+        if not self.notifier.enabled:
+            return
+        status = status or self.status()
+        edges = {
+            "breaker": (
+                status["breaker"] == "open",
+                "цепь Grok разомкнута — пайплайн не покупает",
+                "цепь Grok замкнулась, работа продолжается",
+            ),
+            "halted": (
+                bool(status["halted"]),
+                f"дневной лимит убытка выбран ({self.risk.daily_loss:.4f} SOL), "
+                "торговли сегодня не будет",
+                "новые сутки, торговля возобновлена",
+            ),
+            "stalled": (
+                bool(status["stalled"]),
+                "поток лончей встал: нет событий из сокета",
+                "поток лончей восстановился",
+            ),
+        }
+        for name, (active, on_text, off_text) in edges.items():
+            if active and not self._alerted[name]:
+                self.notifier.notify(name, on_text, **{name: True})
+            elif not active and self._alerted[name]:
+                self.notifier.notify(name, off_text, **{name: False})
+            self._alerted[name] = active
 
     def _creator_verdict(self, token: Token) -> str | None:
         """Причина не связываться с создателем этого токена, или None."""
@@ -343,6 +405,7 @@ class Pipeline:
             "blocked_creators": sum(
                 1 for r in self.reputation.creators.values() if r.is_known_bad
             ),
+            "alerts": self.notifier.snapshot(),
         }
 
     def _market_snapshot(self) -> dict[str, Any]:
@@ -390,6 +453,23 @@ class Pipeline:
         self.metrics.inc(f"exit_{reason}")
         self.metrics.gauge("open_positions", self.risk.open_count)
         log.info("ЗАКРЫТО %s по правилу %s, PnL %+.4f SOL", position.mint[:8], reason, pnl)
+        self.notifier.notify(
+            "close",
+            f"закрыт {position.symbol or position.mint[:8]} по правилу {reason}: "
+            f"{pnl:+.4f} SOL ({change_pct:+.1f}%)",
+            mint=position.mint, reason=reason, pnl_sol=round(pnl, 6),
+            pnl_pct=round(change_pct, 2),
+        )
+        if -change_pct >= self.config.filter.rug_loss_pct:
+            self.notifier.notify(
+                "rug",
+                f"создатель {(position.creator or '?')[:8]} слил "
+                f"{position.symbol or position.mint[:8]} ({change_pct:+.1f}%) — "
+                "его следующие токены отсекаются на входе",
+                creator=position.creator, mint=position.mint,
+                pnl_pct=round(change_pct, 2),
+            )
+        self._check_transitions()
 
 
 # --------------------------------------------------------------------------
