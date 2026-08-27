@@ -49,6 +49,9 @@ class CurveState(BaseModel):
 
     sol_reserves: float = INITIAL_VIRTUAL_SOL
     token_reserves: float = INITIAL_VIRTUAL_TOKENS
+    # Кривая закончилась, токен уехал на Raydium. Вся математика этого
+    # модуля с этого момента к нему неприменима.
+    complete: bool = False
 
     @property
     def is_valid(self) -> bool:
@@ -104,6 +107,7 @@ class CurveState(BaseModel):
             state = cls(
                 sol_reserves=float(sol_raw) / 1e9,
                 token_reserves=float(token_raw) / 1e6,
+                complete=bool(data.get("complete") or data.get("raydium_pool")),
             )
         except (TypeError, ValueError):
             return None
@@ -260,7 +264,10 @@ def state_from_any(data: dict[str, Any], market_cap_sol: float = 0.0) -> CurveSt
     spot = price_from_reserves(data)
     if spot <= 0 and market_cap_sol > 0:
         spot = market_cap_sol / TOTAL_SUPPLY
-    return CurveState.from_spot_price(spot)
+    restored = CurveState.from_spot_price(spot)
+    if restored is not None:
+        restored.complete = bool(data.get("complete") or data.get("raydium_pool"))
+    return restored
 
 
 def price_from_reserves(data: dict[str, Any]) -> float:

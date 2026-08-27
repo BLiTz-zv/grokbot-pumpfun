@@ -8,6 +8,7 @@
 import asyncio
 import json
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -437,7 +438,7 @@ async def test_serve_runs_then_stops_cleanly(config):
 
     saved = StateStore(config.ops.state_path).load()
     assert saved is not None and "Mint1111" in saved.positions
-    assert [r["type"] for r in read_log(config.logging.path)] == ["buy"]
+    assert [r["type"] for r in read_log(config.logging.path)] == ["intent", "buy"]
 
 
 # --- память о создателях --------------------------------------------------
@@ -857,3 +858,103 @@ async def test_outcomes_restored_after_restart(config):
     second = Pipeline(config)
     second.restore()
     assert second.pulse.snapshot()["закрытых_сделок_в_памяти"] == 1
+
+
+# --- переезд на Raydium ---------------------------------------------------
+
+
+def graduated_handler(request: httpx.Request) -> httpx.Response:
+    """Провайдер сообщает, что кривая закончилась."""
+    if request.url.path.endswith("/holders") or "/trades/all/" in request.url.path:
+        return data_handler(request)
+    payload = json.loads(data_handler(request).content)
+    payload["complete"] = True
+    return httpx.Response(200, json=payload)
+
+
+async def test_graduated_token_is_exited_not_left_blind(config):
+    """Токен уехал на Raydium: кривой больше нет, и правила, считающие по
+    ней, ослепли бы ровно в тот момент, когда позиция в лучшем плюсе."""
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    await pipeline.process(fresh_token())
+    assert pipeline.risk.open_count == 1
+
+    graduated = httpx.AsyncClient(base_url="http://test",
+                                  transport=httpx.MockTransport(graduated_handler))
+    pipeline.analyzer._client = graduated
+    pipeline.executor._client = graduated
+
+    assert await pipeline.watcher.check_once() == ["Mint1111"]
+    assert pipeline.risk.open_count == 0
+
+    closes = [r for r in read_log(config.logging.path) if r["type"] == "close"]
+    assert closes[-1]["reason"] == "graduated"
+
+
+async def test_graduation_flag_reaches_the_position(config):
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    await pipeline.process(fresh_token())
+    position = pipeline.risk.positions["Mint1111"]
+    assert not position.graduated
+
+    tick = await pipeline._price("Mint1111")
+    assert not tick.graduated
+
+    pipeline.executor._client = httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(graduated_handler))
+    assert (await pipeline._price("Mint1111")).graduated
+
+
+# --- след намерения купить ------------------------------------------------
+
+
+async def test_intent_is_written_before_execution(config):
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    await pipeline.process(fresh_token())
+
+    kinds = [r["type"] for r in read_log(config.logging.path)]
+    assert kinds.index("intent") < kinds.index("buy")
+
+
+def test_orphan_intent_is_reported_on_restart(config, caplog):
+    """Процесс умер между исполнением и учётом: на диске осталось намерение
+    без покупки. Молчать об этом нельзя — на кошельке могут быть токены,
+    о которых бот не знает."""
+    log_path = Path(config.logging.path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(json.dumps(
+        {"type": "intent", "mint": "Осиротевший", "size_sol": 0.4, "ts": time.time()}
+    ) + "\n")
+
+    pipeline = Pipeline(config)
+    with caplog.at_level("ERROR"):
+        pipeline.restore()
+    assert "Осироте" in caplog.text
+
+
+async def test_completed_intent_is_not_reported(config, caplog):
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    await pipeline.process(fresh_token())        # намерение и покупка вместе
+
+    second = Pipeline(config)
+    with caplog.at_level("ERROR"):
+        second.restore()
+    assert "намерение купить" not in caplog.text
+
+
+def test_unmatched_intents_pairs_records():
+    from src.pipeline import unmatched_intents
+
+    records = [
+        {"type": "intent", "mint": "A"},
+        {"type": "buy", "mint": "A"},
+        {"type": "intent", "mint": "B"},
+        {"type": "skip", "mint": "C"},
+        {"type": "intent", "mint": "D"},
+        {"type": "close", "mint": "D"},
+    ]
+    assert unmatched_intents(records) == ["B"]

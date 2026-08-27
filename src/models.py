@@ -260,6 +260,7 @@ class Position(BaseModel):
     score: float = 0.0
     realized_sol: float = 0.0        # выручка уже закрытых частей позиции
     partials: int = 0                # сколько раз выходили частично
+    graduated: bool = False          # токен уехал на Raydium, кривой больше нет
 
 
 class TradeDecision(BaseModel):
@@ -336,6 +337,7 @@ class RiskConfig(BaseModel):
     daily_loss_limit_sol: float = 2.0
     max_trades_per_day: int = 20
     max_open_positions: int = 3
+    max_total_exposure_sol: float = 1.5   # столько SOL максимум в рынке одновременно
     stop_loss_pct: float = 30.0
     stop_loss_poll_seconds: float = 15.0
     # Выходы вверх и по времени. 0 в любом из них выключает правило.
@@ -537,6 +539,14 @@ class Config(BaseModel):
             errors.append("risk.max_trades_per_day должен быть не меньше 1")
         if risk.max_open_positions < 1:
             errors.append("risk.max_open_positions должен быть не меньше 1")
+        if risk.max_total_exposure_sol <= 0:
+            errors.append("risk.max_total_exposure_sol должен быть больше нуля")
+        if risk.max_total_exposure_sol < risk.max_sol_per_trade:
+            warnings.append(
+                f"risk.max_total_exposure_sol ({risk.max_total_exposure_sol}) меньше "
+                f"потолка одной сделки ({risk.max_sol_per_trade}) — размер всегда "
+                "будет резаться общим лимитом"
+            )
         if not 0 < risk.stop_loss_pct < 100:
             errors.append("risk.stop_loss_pct должен быть в интервале (0, 100)")
         if risk.stop_loss_poll_seconds <= 0:

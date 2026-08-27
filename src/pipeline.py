@@ -50,7 +50,7 @@ from .ops import (
     install_signal_handlers,
 )
 from .reputation import ReputationBook
-from .risk import PositionWatcher, RiskManager
+from .risk import PositionWatcher, RiskManager, Tick
 from .scoring import compute_scores, passes_threshold, weakest_component
 from .state import StateStore
 
@@ -62,6 +62,25 @@ MAX_CONCURRENT_TOKENS = 4
 # Столько без единого события из сокета — считаем поток застрявшим и
 # сообщаем об этом в /healthz. Лончи на pump.fun идут непрерывно.
 STALL_SECONDS = 600.0
+
+
+def unmatched_intents(records: list[dict[str, Any]], tail: int = 200) -> list[str]:
+    """Намерения купить, за которыми не последовало покупки или отказа.
+
+    Смотрим только хвост лога: старые расхождения уже разобраны руками,
+    а нас интересует то, что оборвалось последним запуском.
+    """
+    pending: dict[str, bool] = {}
+    for record in records[-tail:]:
+        mint = record.get("mint")
+        if not mint:
+            continue
+        kind = record.get("type")
+        if kind == "intent":
+            pending[mint] = True
+        elif kind in ("buy", "skip", "close"):
+            pending.pop(mint, None)
+    return list(pending)
 
 
 class Pipeline:
@@ -130,11 +149,18 @@ class Pipeline:
         Исходы прошлых сделок тоже поднимаются: агент-тайминг не должен
         после каждого рестарта считать, что история пуста.
         """
-        seeded = self.pulse.seed_from_log(
-            read_log(self.config.logging.path), self.config.filter.rug_loss_pct
-        )
+        records = list(read_log(self.config.logging.path))
+        seeded = self.pulse.seed_from_log(records, self.config.filter.rug_loss_pct)
         if seeded:
             log.info("в память рынка поднято %d прошлых исходов", seeded)
+        for mint in unmatched_intents(records):
+            log.error("на диске осталось намерение купить %s без записи о покупке — "
+                      "возможно, процесс умер во время исполнения. Проверьте кошелёк: "
+                      "позиция может существовать, а бот о ней не знает", mint[:8])
+            self.notifier.notify(
+                "stalled", f"незакрытое намерение купить {mint[:8]} после рестарта",
+                mint=mint,
+            )
         forgotten = self.reputation.forget_older_than(self.config.filter.forget_creators_after_days)
         log.info("книга репутации: %s%s", self.reputation.summary(),
                  f", забыто устаревших {forgotten}" if forgotten else "")
@@ -298,8 +324,10 @@ class Pipeline:
         if not decision.approved:
             return self._reject(analysis, stage="risk", reason=decision.reason)
 
-        # 9. Исполнение.
+        # 9. Исполнение. Намерение фиксируется до отправки: если процесс
+        # умрёт между исполнением и учётом, след останется на диске.
         self._sync_counters()
+        self.trade_log.intent(analysis, size_sol=decision.size_sol)
         try:
             result = await self.executor.buy(token, decision.size_sol)
         except NotImplementedError as exc:
@@ -429,6 +457,7 @@ class Pipeline:
             "in_flight": len(self._tasks),
             "pending_launches": len(self.monitor.pending),
             "open_positions": self.risk.open_count,
+            "exposure_sol": round(self.risk.exposure_sol, 6),
             "blind_positions": len(self.watcher.blind),
             "trades_today": self.risk.trades_today,
             "realized_pnl_sol": round(self.risk.realized_pnl_sol, 6),
@@ -460,8 +489,12 @@ class Pipeline:
         self.pulse.record_launch(token.sol_in_curve)
         self.trade_log.skip(token, stage="monitor", reason=reason)
 
-    async def _price(self, mint: str) -> float:
-        return await self.executor.price(mint)
+    async def _price(self, mint: str) -> Tick:
+        """Цена позиции плюс признак того, что токен уехал с кривой."""
+        state = await self.executor.curve(mint)
+        if state is None:
+            return Tick()
+        return Tick(price=state.spot_price, graduated=state.complete)
 
     async def _sell(
         self,

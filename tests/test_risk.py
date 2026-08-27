@@ -496,3 +496,58 @@ def test_partial_registers_money_but_keeps_position(config, tmp_path):
     assert manager.realized_pnl_sol == pytest.approx(0.3)
     assert "A" in manager.positions
     assert store.load().realized_pnl_sol == pytest.approx(0.3)
+
+
+# --- общая экспозиция -----------------------------------------------------
+
+
+def test_exposure_counts_open_positions(manager):
+    manager.risk.max_total_exposure_sol = 1.0
+    manager.register_open(position("A", sol=0.4))
+    manager.register_open(position("B", sol=0.3))
+    assert manager.exposure_sol == pytest.approx(0.7)
+    assert manager.remaining_exposure == pytest.approx(0.3)
+
+
+def test_size_capped_by_free_exposure(manager):
+    """Три позиции по потолку — это одна большая ставка, а не три мелкие:
+    мемкоины валятся вместе."""
+    manager.risk.max_total_exposure_sol = 1.0
+    manager.register_open(position("A", sol=0.8))
+    assert manager.position_size(1.0) == pytest.approx(0.2)
+
+
+def test_trade_refused_when_exposure_is_full(manager):
+    manager.risk.max_total_exposure_sol = 0.5
+    manager.register_open(position("A", sol=0.5))
+    decision = manager.evaluate("B", 1.0)
+    assert not decision.approved
+    assert decision.reason.startswith("max_total_exposure")
+
+
+def test_partial_exit_frees_exposure(manager):
+    """Частичная фиксация возвращает свободу: то, что уже забрано,
+    риском больше не является."""
+    manager.risk.max_total_exposure_sol = 1.0
+    pos = position("A", sol=0.999)
+    manager.register_open(pos)
+    assert not manager.evaluate("B", 1.0).approved
+
+    pos.sol_spent = 0.3                      # продали две трети
+    decision = manager.evaluate("B", 1.0)
+    assert decision.approved
+    assert decision.size_sol == pytest.approx(0.5)
+
+
+def test_nearly_full_exposure_shrinks_instead_of_refusing(manager):
+    """Пока остаток осмысленный, сделка не отменяется, а уменьшается."""
+    manager.risk.max_total_exposure_sol = 1.0
+    manager.register_open(position("A", sol=0.9))
+    decision = manager.evaluate("B", 1.0)
+    assert decision.approved
+    assert decision.size_sol == pytest.approx(0.1)
+
+
+def test_exposure_in_snapshot(manager):
+    manager.register_open(position("A", sol=0.4))
+    assert manager.snapshot()["exposure_sol"] == pytest.approx(0.4)

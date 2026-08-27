@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -51,7 +52,9 @@ class TradeLog:
         self.mode = mode
         self.max_bytes = max(0, max_bytes)
         self.backups = max(1, backups)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_failures = 0
+        with contextlib.suppress(OSError):
+            self.path.parent.mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def from_config(cls, config: Any) -> TradeLog:
@@ -88,11 +91,23 @@ class TradeLog:
     # -- запись ------------------------------------------------------------
 
     def _write(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Записать строку. Сбой записи не останавливает торговлю.
+
+        Кончившееся место на диске — плохо, но не повод бросить открытые
+        позиции без присмотра. Пропущенные записи считаются, и по счётчику
+        видно, что лог неполон.
+        """
         record.setdefault("ts", time.time())
         record.setdefault("mode", self.mode)
-        self.rotate_if_needed()
-        with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        try:
+            self.rotate_if_needed()
+            with self.path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except (OSError, TypeError, ValueError) as exc:
+            self.write_failures += 1
+            if self.write_failures in (1, 10, 100):
+                log.error("запись в %s не удалась (%d-я): %s",
+                          self.path, self.write_failures, exc)
         return record
 
     def buy(
@@ -128,6 +143,22 @@ class TradeLog:
                 },
             }
         )
+
+    def intent(self, analysis: Analysis, *, size_sol: float) -> dict[str, Any]:
+        """Запись о намерении купить — до отправки транзакции.
+
+        Если процесс умрёт между исполнением и учётом позиции, на диске
+        останется след: намерение без покупки. На старте это видно, и
+        можно проверить кошелёк руками, а не обнаружить лишние токены
+        через неделю.
+        """
+        return self._write({
+            "type": "intent",
+            "mint": analysis.token.mint,
+            "symbol": analysis.token.symbol,
+            "size_sol": round(size_sol, 6),
+            "score": analysis.scores.total,
+        })
 
     def skip(
         self,

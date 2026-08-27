@@ -87,3 +87,42 @@ def test_from_config_uses_logging_section(tmp_path):
     cfg.logging.backups = 2
     log = TradeLog.from_config(cfg)
     assert (log.max_bytes, log.backups, log.mode) == (123, 2, "dry-run")
+
+
+# --- лог не роняет торговлю -----------------------------------------------
+
+
+def test_write_failure_is_counted_not_raised(tmp_path, caplog):
+    """Кончившееся место на диске — плохо, но не повод бросить открытые
+    позиции без присмотра."""
+    log = TradeLog(tmp_path / "не-каталог" / "trades.jsonl")
+    log.path = tmp_path / "нет" / "нет" / "trades.jsonl"     # каталога не существует
+
+    with caplog.at_level("ERROR"):
+        record = log.skip(token(), stage="monitor", reason="few_buyers")
+
+    assert record["type"] == "skip"          # вызывающий получил свою запись
+    assert log.write_failures == 1
+    assert "не удалась" in caplog.text
+
+
+def test_repeated_failures_do_not_spam_the_log(tmp_path, caplog):
+    log = TradeLog(tmp_path / "trades.jsonl")
+    log.path = tmp_path / "нет" / "trades.jsonl"
+    with caplog.at_level("ERROR"):
+        for _ in range(5):
+            log.skip(token(), stage="monitor", reason="few_buyers")
+    assert log.write_failures == 5
+    assert caplog.text.count("не удалась") == 1     # только первая
+
+
+def test_intent_record_precedes_purchase(tmp_path):
+    from src.models import Analysis, Scores
+    from src.models import Token as T
+
+    log = TradeLog(tmp_path / "trades.jsonl")
+    analysis = Analysis(token=T(mint="M" * 8, symbol="CAT"), scores=Scores(total=0.8))
+    record = log.intent(analysis, size_sol=0.4)
+    assert record["type"] == "intent"
+    assert record["size_sol"] == 0.4
+    assert record["score"] == 0.8

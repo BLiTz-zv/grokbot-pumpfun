@@ -21,6 +21,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -138,18 +139,33 @@ class RiskManager:
     def open_count(self) -> int:
         return len(self.positions)
 
+    @property
+    def exposure_sol(self) -> float:
+        """Сколько SOL сейчас в рынке. Считается по остаточной себестоимости:
+        то, что уже забрано частичной фиксацией, риском больше не является."""
+        return sum(position.sol_spent for position in self.positions.values())
+
+    @property
+    def remaining_exposure(self) -> float:
+        return max(0.0, self.risk.max_total_exposure_sol - self.exposure_sol)
+
     # -- решение -----------------------------------------------------------
 
     def position_size(self, score: float, liquidity_cap: float | None = None) -> float:
-        """Размер позиции: пропорционален скорингу, ограничен сверху трижды.
+        """Размер позиции: пропорционален скорингу и ограничен сверху четырьмя
+        потолками — потолком сделки, остатком дневного лимита, свободной
+        экспозицией и ликвидностью кривой.
 
-        Третий потолок — ликвидность кривой. Заявка, двигающая цену на
-        проценты, покупает сама у себя: часть ожидаемого движения уходит
-        на собственное проскальзывание ещё до того, как рынок что-то решит.
+        Про ликвидность: заявка, двигающая цену на проценты, покупает сама
+        у себя — часть ожидаемого движения уходит на собственное
+        проскальзывание ещё до того, как рынок что-то решит.
+
+        Про экспозицию: три позиции по потолку — это уже не три маленькие
+        ставки, а одна большая, потому что мемкоины валятся вместе.
         """
         by_score = self.risk.max_sol_per_trade * max(0.0, min(1.0, score))
         by_budget = self.remaining_loss_budget * MAX_SHARE_OF_REMAINING_BUDGET
-        limits = [by_score, by_budget]
+        limits = [by_score, by_budget, self.remaining_exposure]
         if liquidity_cap is not None and liquidity_cap > 0:
             limits.append(liquidity_cap)
         return round(min(limits), 6)
@@ -177,6 +193,12 @@ class RiskManager:
             )
         if mint in self.positions:
             return TradeDecision(approved=False, reason="already_open")
+        if self.remaining_exposure < MIN_TRADE_SOL:
+            return TradeDecision(
+                approved=False,
+                reason=(f"max_total_exposure ({self.exposure_sol:.4f}/"
+                        f"{self.risk.max_total_exposure_sol:.4f} SOL)"),
+            )
 
         size = self.position_size(score, liquidity_cap)
         if size < MIN_TRADE_SOL:
@@ -214,6 +236,7 @@ class RiskManager:
             "day": self.day,
             "trades_today": self.trades_today,
             "open_positions": self.open_count,
+            "exposure_sol": round(self.exposure_sol, 6),
             "realized_pnl_sol": round(self.realized_pnl_sol, 6),
             "remaining_loss_budget": round(self.remaining_loss_budget, 6),
             "halted": self.halted,
@@ -229,6 +252,20 @@ class RiskManager:
 # забираем прибыль, потом бережём прибыль, и только потом закрываем по
 # времени: позиция, которая едет вверх, не должна закрыться по таймеру.
 EXIT_REASONS = ("stop_loss", "take_profit", "trailing_stop", "max_hold")
+
+
+class Tick(BaseModel):
+    """Одно наблюдение цены позиции."""
+
+    price: float = 0.0
+    graduated: bool = False       # токен уехал с кривой на Raydium
+
+    @classmethod
+    def of(cls, value: Tick | float | None) -> Tick:
+        """Принимаем и голое число: колбэк цены бывает и простым."""
+        if isinstance(value, Tick):
+            return value
+        return cls(price=float(value or 0.0))
 
 
 class ExitSignal(BaseModel):
@@ -270,6 +307,12 @@ def exit_signal(
 
     if risk.stop_loss_pct and -change >= risk.stop_loss_pct:
         return ExitSignal(reason="stop_loss", detail=f"{change:+.1f}% от входа")
+
+    # Переезд на Raydium — хорошая новость и одновременно конец нашей
+    # математики: кривой больше нет, ценой мы больше не управляем. Выходим
+    # сразу, а не ждём, пока правила, считающие по кривой, ослепнут.
+    if position.graduated:
+        return ExitSignal(reason="graduated", detail=f"уехал на Raydium, {change:+.1f}%")
 
     # Первый take-profit может быть частичным: забрать основное и оставить
     # хвост трейлингу. Повторно правило не срабатывает — иначе позиция
@@ -322,7 +365,7 @@ class PositionWatcher:
     def __init__(
         self,
         manager: RiskManager,
-        price_fn: Callable[[str], Awaitable[float]],
+        price_fn: Callable[[str], Awaitable[Any]],
         sell_fn: Callable[[Position, float, str, float], Awaitable[None]],
     ) -> None:
         self.manager = manager
@@ -344,10 +387,15 @@ class PositionWatcher:
 
         for position in list(self.manager.positions.values()):
             try:
-                price = await self.price_fn(position.mint)
+                tick = Tick.of(await self.price_fn(position.mint))
             except Exception as exc:
                 log.warning("цена для %s недоступна: %s", position.mint, exc)
-                price = 0.0
+                tick = Tick()
+            price = tick.price
+            if tick.graduated and not position.graduated:
+                log.info("%s уехал на Raydium — выходим, наши правила там не работают",
+                         position.mint[:8])
+                position.graduated = True
             if price <= 0:
                 self._miss(position.mint)
                 continue

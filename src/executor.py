@@ -187,6 +187,20 @@ class DryRunExecutor(BaseExecutor):
             return ExecutionResult(ok=False, error="состояние кривой неизвестно")
 
         tokens = self._portion(position, fraction)
+        if state.complete:
+            # Кривой больше нет: токен торгуется на Raydium со своей
+            # ликвидностью, и постоянное произведение к нему неприменимо.
+            # Считаем по споту без влияния и честно помечаем прикидкой.
+            log.warning("%s уже на Raydium: выручка посчитана по споту, "
+                        "без проскальзывания — это прикидка, а не котировка",
+                        position.mint[:8])
+            gross = tokens * state.spot_price
+            fee = gross * self.market.trade_fee_pct / 100.0
+            return ExecutionResult(
+                ok=True, tx_hash=DRY_RUN_TX, price=state.spot_price,
+                token_amount=tokens, sol_amount=gross - fee, fee_sol=fee,
+            )
+
         result = self.plan_sell(state, tokens)
         if not result.ok:
             return result
