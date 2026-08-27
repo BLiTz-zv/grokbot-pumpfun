@@ -232,6 +232,14 @@ class Scores(BaseModel):
     total: float = 0.0
 
 
+class TradeDecision(BaseModel):
+    """Решение риск-гейта."""
+
+    approved: bool
+    size_sol: float = 0.0
+    reason: str = ""
+
+
 class Analysis(BaseModel):
     """Всё, что пайплайн узнал о токене к моменту решения."""
 
@@ -242,6 +250,7 @@ class Analysis(BaseModel):
     narrative: NarrativeResult | None = None
     timing: TimingResult | None = None
     scores: Scores = Field(default_factory=Scores)
+    plan: TradeDecision | None = None   # что именно собираемся сделать
     checker: CheckerResult | None = None
 
 
@@ -261,14 +270,6 @@ class Position(BaseModel):
     realized_sol: float = 0.0        # выручка уже закрытых частей позиции
     partials: int = 0                # сколько раз выходили частично
     graduated: bool = False          # токен уехал на Raydium, кривой больше нет
-
-
-class TradeDecision(BaseModel):
-    """Решение риск-гейта."""
-
-    approved: bool
-    size_sol: float = 0.0
-    reason: str = ""
 
 
 # --------------------------------------------------------------------------

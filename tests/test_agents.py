@@ -315,3 +315,53 @@ def test_every_prompt_demands_bare_json(agent_cls):
     assert "JSON" in prompt
     assert "markdown" in prompt.lower()
     assert prompt.strip().endswith("```.")
+
+
+# --- чекер видит экономику сделки ----------------------------------------
+
+
+def analysis_with_plan():
+    from src.curve import INITIAL_VIRTUAL_SOL, CurveState
+    from src.models import TokenMetrics, TradeDecision
+
+    fresh = CurveState()
+    sol = INITIAL_VIRTUAL_SOL + 15.0
+    return Analysis(
+        token=token(),
+        metrics=TokenMetrics(risk_score=3.0, round_trip_cost_pct=1.99,
+                             curve_liquidity_sol=15.0),
+        curve=CurveState(sol_reserves=sol, token_reserves=fresh.k / sol),
+        plan=TradeDecision(approved=True, size_sol=0.4, reason="ok"),
+    )
+
+
+async def test_checker_sees_the_trade_economics(config):
+    """Чекер должен знать, во что обойдётся сделка, а не только то,
+    насколько хорош токен."""
+    calls: list = []
+    body = json.dumps({"approve": False, "reason": "круг дороже движения",
+                       "flags": ["издержки"], "confidence": 0.8})
+    async with CheckerAgent(config, client_returning(body, calls)) as agent:
+        await agent.run(analysis_with_plan())
+
+    план = json.loads(calls[0]["messages"][1]["content"])["план"]
+    assert план["размер_sol"] == 0.4
+    assert план["стоимость_круга_pct"] == 1.99
+    assert план["влияние_на_цену_pct"] > 0
+    assert план["take_profit_pct"] == config.risk.take_profit_pct
+    assert план["stop_loss_pct"] == config.risk.stop_loss_pct
+
+
+async def test_checker_prompt_demands_cost_check(config):
+    assert "стоимость_круга_pct" in CheckerAgent.prompt
+    assert "влияние_на_цену_pct" in CheckerAgent.prompt
+
+
+async def test_plan_absent_does_not_break_the_checker(config):
+    calls: list = []
+    body = json.dumps({"approve": True, "reason": "ок", "flags": [], "confidence": 0.7})
+    async with CheckerAgent(config, client_returning(body, calls)) as agent:
+        result = await agent.run(full_analysis())
+    assert result.approve
+    план = json.loads(calls[0]["messages"][1]["content"])["план"]
+    assert план["размер_sol"] is None

@@ -305,6 +305,15 @@ class Pipeline:
             return self._reject(analysis, stage="scoring", reason=reason,
                                 detail=f"слабее всего {name}={value:.3f}")
 
+        # План сделки считается до чекера: ему нужно видеть, во что
+        # обойдётся вход и выход, а не только то, как хорош токен.
+        liquidity_cap = (
+            max_sol_for_impact(curve, self.config.market.max_price_impact_pct,
+                               self.config.market.trade_fee_pct)
+            if curve else 0.0
+        )
+        analysis.plan = self.risk.evaluate(token.mint, analysis.scores.total, liquidity_cap)
+
         # 7. Адверсариальный чекер на сильной модели.
         analysis.checker = await self.checker.run(analysis)
         if not analysis.checker.approve:
@@ -313,13 +322,8 @@ class Pipeline:
                 detail=f"{analysis.checker.reason} [{', '.join(analysis.checker.flags)}]",
             )
 
-        # 8. Риск-гейт. Потолок по ликвидности считается до размера позиции:
-        # заявка, двигающая цену на проценты, съедает своё же движение.
-        liquidity_cap = (
-            max_sol_for_impact(curve, self.config.market.max_price_impact_pct,
-                               self.config.market.trade_fee_pct)
-            if curve else 0.0
-        )
+        # 8. Риск-гейт. Пересчитывается после чекера: пока сильная модель
+        # думала, могли открыться другие позиции и лимиты поменялись.
         decision = self.risk.evaluate(token.mint, analysis.scores.total, liquidity_cap)
         if not decision.approved:
             return self._reject(analysis, stage="risk", reason=decision.reason)

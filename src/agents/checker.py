@@ -12,8 +12,9 @@ approve: false — это нормальный, ожидаемый исход. �
 from __future__ import annotations
 
 import json
-from typing import ClassVar
+from typing import Any, ClassVar
 
+from ..curve import buy_quote
 from ..models import Analysis, CheckerResult
 from .base import JSON_ONLY, GrokAgent
 
@@ -32,6 +33,13 @@ CHECKER_PROMPT = f"""Ты — риск-офицер, который подпис
 3. Слабую доказательную базу: низкий confidence аудитора, мало сделок,
    отсутствие данных при уверенных выводах.
 4. Рыночный фон, при котором даже хороший токен не поедет.
+5. Экономику самой сделки. В блоке "план" лежит то, что реально
+   произойдёт: размер заявки, во что обойдётся вход и немедленный выход
+   (стоимость_круга_pct), насколько своя же заявка сдвинет цену
+   (влияние_на_цену_pct), и где стоят выходы. Если стоимость круга
+   сопоставима с движением, ради которого затевается сделка, или заявка
+   двигает цену на проценты — это причина отказать, даже когда сам токен
+   выглядит прилично.
 
 Правила решения:
 - Сомневаешься — approve: false.
@@ -52,7 +60,7 @@ CHECKER_PROMPT = f"""Ты — риск-офицер, который подпис
 
 class CheckerAgent(GrokAgent):
     name: ClassVar[str] = "checker"
-    version: ClassVar[str] = "checker-1"
+    version: ClassVar[str] = "checker-2"
     prompt: ClassVar[str] = CHECKER_PROMPT
     result_model: ClassVar[type] = CheckerResult
     use_checker_model: ClassVar[bool] = True
@@ -79,8 +87,28 @@ class CheckerAgent(GrokAgent):
             "narrative": analysis.narrative.model_dump() if analysis.narrative else None,
             "timing": analysis.timing.model_dump() if analysis.timing else None,
             "scores": analysis.scores.model_dump(),
+            "план": self._plan(analysis),
         }
         return json.dumps(payload, ensure_ascii=False)
+
+    def _plan(self, analysis: Analysis) -> dict[str, Any]:
+        """Экономика сделки, которую собираемся совершить."""
+        risk = self.config.risk
+        plan: dict[str, Any] = {
+            "размер_sol": round(analysis.plan.size_sol, 6) if analysis.plan else None,
+            "одобрено_риском": analysis.plan.approved if analysis.plan else None,
+            "стоимость_круга_pct": analysis.metrics.round_trip_cost_pct,
+            "ликвидность_кривой_sol": analysis.metrics.curve_liquidity_sol,
+            "take_profit_pct": risk.take_profit_pct,
+            "stop_loss_pct": risk.stop_loss_pct,
+            "лимит_удержания_мин": round(risk.max_hold_seconds / 60, 1),
+        }
+        if analysis.curve is not None and analysis.plan is not None:
+            quote = buy_quote(analysis.curve, analysis.plan.size_sol,
+                              self.config.market.trade_fee_pct)
+            if quote.ok:
+                plan["влияние_на_цену_pct"] = round(quote.impact_pct, 3)
+        return plan
 
     def fallback(self, reason: str) -> CheckerResult:
         return CheckerResult.pessimistic(reason)

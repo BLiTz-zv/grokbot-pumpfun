@@ -979,3 +979,18 @@ async def test_buy_records_prompt_versions(config):
 def test_prompt_versions_are_distinct(config):
     versions = Pipeline(config).prompt_versions()
     assert len(set(versions.values())) == len(versions)
+
+
+async def test_plan_is_computed_before_the_checker(config):
+    """Риск-гейт считается дважды: до чекера — чтобы он видел экономику,
+    после — потому что за время его раздумий лимиты могли измениться."""
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    analysis = await pipeline.process(fresh_token())
+
+    assert analysis is not None
+    assert analysis.plan is not None
+    assert analysis.plan.approved
+    assert analysis.plan.size_sol == pytest.approx(
+        pipeline.risk.positions["Mint1111"].sol_spent
+    )
