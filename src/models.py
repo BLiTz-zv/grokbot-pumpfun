@@ -339,6 +339,8 @@ class RiskConfig(BaseModel):
     max_trades_per_day: int = 20
     max_open_positions: int = 3
     max_total_exposure_sol: float = 1.5   # столько SOL максимум в рынке одновременно
+    cooldown_after_losses: int = 3        # столько убытков подряд — и пауза; 0 выключает
+    cooldown_minutes: float = 30.0
     stop_loss_pct: float = 30.0
     stop_loss_poll_seconds: float = 15.0
     # Выходы вверх и по времени. 0 в любом из них выключает правило.
@@ -381,7 +383,7 @@ class AlertsConfig(SecretModel):
     webhook_url: SecretStr = SecretStr("")
     events: list[str] = Field(
         default_factory=lambda: [
-            "started", "buy", "close", "rug", "breaker", "halted", "blind"
+            "started", "buy", "close", "rug", "breaker", "halted", "blind", "cooldown"
         ]
     )
     timeout_seconds: float = 10.0
@@ -435,9 +437,10 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
 
 
 # События, которые пайплайн умеет отправлять в webhook.
-ALERT_EVENTS = frozenset(
-    {"started", "stopped", "buy", "close", "rug", "breaker", "halted", "stalled", "blind"}
-)
+ALERT_EVENTS = frozenset({
+    "started", "stopped", "buy", "close", "rug",
+    "breaker", "halted", "stalled", "blind", "cooldown",
+})
 
 
 class ConfigError(RuntimeError):
@@ -542,6 +545,10 @@ class Config(BaseModel):
             errors.append("risk.max_open_positions должен быть не меньше 1")
         if risk.max_total_exposure_sol <= 0:
             errors.append("risk.max_total_exposure_sol должен быть больше нуля")
+        if risk.cooldown_after_losses < 0:
+            errors.append("risk.cooldown_after_losses не может быть отрицательным")
+        if risk.cooldown_minutes < 0:
+            errors.append("risk.cooldown_minutes не может быть отрицательным")
         if risk.max_total_exposure_sol < risk.max_sol_per_trade:
             warnings.append(
                 f"risk.max_total_exposure_sol ({risk.max_total_exposure_sol}) меньше "

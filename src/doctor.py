@@ -27,6 +27,7 @@ import websockets
 
 from .curve import sanity_check
 from .models import Config, mask
+from .state import InstanceLock
 
 log = logging.getLogger(__name__)
 
@@ -110,6 +111,14 @@ def check_paths(config: Config) -> list[Check]:
         except OSError as exc:
             checks.append(Check(f"{name} пишется", FAIL, str(exc),
                                 f"дайте процессу права на {path.parent}"))
+
+    lock = InstanceLock(config.ops.state_path)
+    holder = lock._holder()
+    if holder and lock._alive(holder) and holder != os.getpid():
+        checks.append(Check("состояние свободно", FAIL, f"занято процессом {holder}",
+                            "уже запущен другой бот на этом же состоянии"))
+    else:
+        checks.append(Check("состояние свободно", OK))
 
     free_mb = shutil.disk_usage(Path(config.logging.path).parent.resolve()).free / 1e6
     checks.append(Check(

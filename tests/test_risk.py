@@ -551,3 +551,84 @@ def test_nearly_full_exposure_shrinks_instead_of_refusing(manager):
 def test_exposure_in_snapshot(manager):
     manager.register_open(position("A", sol=0.4))
     assert manager.snapshot()["exposure_sol"] == pytest.approx(0.4)
+
+
+# --- пауза после серии убытков --------------------------------------------
+
+
+def test_losing_streak_triggers_cooldown(config):
+    """Дневной лимит ловит медленное истечение, но не быструю серию."""
+    clock = FakeClock()
+    config.risk.cooldown_after_losses = 3
+    config.risk.cooldown_minutes = 30.0
+    manager = RiskManager(config, clock=clock)
+
+    for index in range(2):
+        manager.register_close(f"M{index}", pnl_sol=-0.1)
+    assert not manager.cooling_down
+    assert manager.evaluate("N", 0.9).approved
+
+    manager.register_close("M3", pnl_sol=-0.1)
+    assert manager.cooling_down
+    decision = manager.evaluate("N", 0.9)
+    assert not decision.approved
+    assert decision.reason.startswith("cooldown_after_losses")
+
+
+def test_profit_resets_the_streak(config):
+    config.risk.cooldown_after_losses = 3
+    manager = RiskManager(config, clock=FakeClock())
+    manager.register_close("A", pnl_sol=-0.1)
+    manager.register_close("B", pnl_sol=-0.1)
+    manager.register_close("C", pnl_sol=+0.2)
+    assert manager.losing_streak == 0
+    manager.register_close("D", pnl_sol=-0.1)
+    assert not manager.cooling_down
+
+
+def test_cooldown_expires(config):
+    clock = FakeClock()
+    config.risk.cooldown_after_losses = 2
+    config.risk.cooldown_minutes = 30.0
+    manager = RiskManager(config, clock=clock)
+    manager.register_close("A", pnl_sol=-0.1)
+    manager.register_close("B", pnl_sol=-0.1)
+    assert manager.cooling_down
+
+    clock.now += 31 * 60
+    assert not manager.cooling_down
+    assert manager.evaluate("N", 0.9).approved
+
+
+def test_cooldown_can_be_disabled(config):
+    config.risk.cooldown_after_losses = 0
+    manager = RiskManager(config, clock=FakeClock())
+    for index in range(10):
+        manager.register_close(f"M{index}", pnl_sol=-0.05)
+    assert not manager.cooling_down
+
+
+def test_cooldown_survives_restart(config, tmp_path):
+    from src.state import StateStore
+
+    clock = FakeClock()
+    config.risk.cooldown_after_losses = 2
+    store = StateStore(tmp_path / "state.json")
+    first = RiskManager(config, clock=clock, store=store)
+    first.register_close("A", pnl_sol=-0.1)
+    first.register_close("B", pnl_sol=-0.1)
+    assert first.cooling_down
+
+    second = RiskManager(config, clock=clock, store=store)
+    second.restore()
+    assert second.cooling_down
+    assert second.losing_streak == 2
+
+
+def test_cooldown_in_snapshot(config):
+    config.risk.cooldown_after_losses = 1
+    manager = RiskManager(config, clock=FakeClock())
+    manager.register_close("A", pnl_sol=-0.1)
+    snapshot = manager.snapshot()
+    assert snapshot["losing_streak"] == 1
+    assert snapshot["cooldown_left_seconds"] > 0

@@ -55,6 +55,8 @@ class RiskManager:
         self.realized_pnl_sol = 0.0          # отрицательное = убыток
         self.positions: dict[str, Position] = {}
         self.grok_calls_today = 0
+        self.losing_streak = 0
+        self.cooldown_until = 0.0
 
     # -- состояние на диске ------------------------------------------------
 
@@ -72,6 +74,8 @@ class RiskManager:
             return False
 
         self.positions = dict(state.positions)
+        self.losing_streak = state.losing_streak
+        self.cooldown_until = state.cooldown_until
         if state.day == self.day:
             self.trades_today = state.trades_today
             self.realized_pnl_sol = state.realized_pnl_sol
@@ -95,6 +99,8 @@ class RiskManager:
                 trades_today=self.trades_today,
                 realized_pnl_sol=self.realized_pnl_sol,
                 grok_calls_today=self.grok_calls_today,
+                losing_streak=self.losing_streak,
+                cooldown_until=self.cooldown_until,
                 positions=self.positions,
             )
         )
@@ -134,6 +140,20 @@ class RiskManager:
         """Дневной лимит убытка выбран — до конца суток не торгуем."""
         self.roll_day_if_needed()
         return self.daily_loss >= self.risk.daily_loss_limit_sol
+
+    @property
+    def cooling_down(self) -> bool:
+        """Пауза после серии убытков.
+
+        Дневной лимит ловит медленное истечение, но не быструю серию: три
+        стопа подряд обычно означают враждебный режим, а не невезение.
+        Пауза не даёт скормить ему остаток дневного бюджета за десять минут.
+        """
+        return self.clock() < self.cooldown_until
+
+    @property
+    def cooldown_left_seconds(self) -> float:
+        return max(0.0, self.cooldown_until - self.clock())
 
     @property
     def open_count(self) -> int:
@@ -181,6 +201,12 @@ class RiskManager:
                 approved=False,
                 reason=f"daily_loss_limit_hit ({self.daily_loss:.4f} SOL)",
             )
+        if self.cooling_down:
+            return TradeDecision(
+                approved=False,
+                reason=(f"cooldown_after_losses ({self.losing_streak} подряд, "
+                        f"осталось {self.cooldown_left_seconds / 60:.0f} мин)"),
+            )
         if self.trades_today >= self.risk.max_trades_per_day:
             return TradeDecision(
                 approved=False,
@@ -225,11 +251,25 @@ class RiskManager:
     def register_close(self, mint: str, pnl_sol: float) -> Position | None:
         position = self.positions.pop(mint, None)
         self.realized_pnl_sol += pnl_sol
+        self._update_streak(pnl_sol)
         self.persist()
         if self.halted:
             log.warning("дневной лимит убытка выбран, торговля остановлена до %s",
                         "следующих суток UTC")
         return position
+
+    def _update_streak(self, pnl_sol: float) -> None:
+        """Учесть исход сделки в серии убытков и, если пора, взять паузу."""
+        if pnl_sol >= 0:
+            self.losing_streak = 0
+            return
+        self.losing_streak += 1
+        threshold = self.risk.cooldown_after_losses
+        if threshold and self.losing_streak >= threshold and self.risk.cooldown_minutes:
+            self.cooldown_until = self.clock() + self.risk.cooldown_minutes * 60.0
+            log.warning("%d убытка подряд — пауза на %.0f минут: серия стопов обычно "
+                        "означает враждебный режим, а не невезение",
+                        self.losing_streak, self.risk.cooldown_minutes)
 
     def snapshot(self) -> dict[str, float | int | str]:
         return {
@@ -241,6 +281,8 @@ class RiskManager:
             "remaining_loss_budget": round(self.remaining_loss_budget, 6),
             "halted": self.halted,
             "grok_calls_today": self.grok_calls_today,
+            "losing_streak": self.losing_streak,
+            "cooldown_left_seconds": round(self.cooldown_left_seconds, 1),
         }
 
 

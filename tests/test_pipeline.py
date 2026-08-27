@@ -994,3 +994,52 @@ async def test_plan_is_computed_before_the_checker(config):
     assert analysis.plan.size_sol == pytest.approx(
         pipeline.risk.positions["Mint1111"].sol_spent
     )
+
+
+# --- один бот на одно состояние -------------------------------------------
+
+
+async def test_second_instance_refuses_to_start(config, monkeypatch):
+    """Два процесса на одном состоянии — два бота на одном кошельке."""
+    import os
+
+    first = Pipeline(config)
+    assert first.lock.acquire()
+
+    monkeypatch.setattr(os, "getpid", lambda: os.getppid())
+    second = Pipeline(config)
+    async with second:
+        assert await second.serve() == 2
+
+    first.lock.release()
+
+
+async def test_lock_released_after_shutdown(config):
+    pipeline = Pipeline(config)
+    pipeline.lock.acquire()
+    await pipeline.shutdown()
+    assert not pipeline.lock.path.exists()
+
+
+async def test_cooldown_blocks_new_buys(config):
+    config.risk.cooldown_after_losses = 1
+    config.risk.cooldown_minutes = 30.0
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    await pipeline.process(fresh_token())
+
+    position = pipeline.risk.positions["Mint1111"]
+    move_price(0.5)
+    await pipeline._sell(position, price=await pipeline._price(position.mint),
+                         reason="stop_loss")
+    assert pipeline.risk.cooling_down
+
+    move_price(2.0)
+    другой = fresh_token()
+    другой.mint = "Mint7777"
+    другой.creator = "Creator7"
+    assert await pipeline.process(другой) is None
+
+    records = list(read_log(config.logging.path))
+    assert records[-1]["reason"].startswith("cooldown_after_losses")
+    assert pipeline.status()["losing_streak"] == 1

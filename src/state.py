@@ -37,6 +37,8 @@ class PipelineState(BaseModel):
     trades_today: int = 0
     realized_pnl_sol: float = 0.0
     grok_calls_today: int = 0
+    losing_streak: int = 0
+    cooldown_until: float = 0.0
     positions: dict[str, Position] = Field(default_factory=dict)
     updated_at: float = 0.0
 
@@ -90,6 +92,77 @@ class StateStore:
 
     def clear(self) -> None:
         self.path.unlink(missing_ok=True)
+
+
+class InstanceLock:
+    """Замок «один бот на одно состояние».
+
+    Два процесса на одном файле состояния — это два бота на одном кошельке:
+    они перезапишут позиции друг друга, дважды выберут дневной лимит и
+    купят один и тот же токен. Замок стоит копейки, а спасает от сценария,
+    который иначе обнаруживается по деньгам.
+
+    Замок от мёртвого процесса перехватывается: падение не должно
+    оставлять систему незапускаемой.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(str(path) + ".lock")
+        self.acquired = False
+
+    def _holder(self) -> int | None:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            return int(data.get("pid") or 0) or None
+        except (OSError, ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:      # процесс есть, но чужой
+            return True
+        return True
+
+    def acquire(self) -> bool:
+        """Занять замок. False, если его держит живой процесс."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        pid = self._holder()
+        if pid and pid != os.getpid() and self._alive(pid):
+            log.error("состояние %s уже занято процессом %d — второй бот на том "
+                      "же кошельке не запускается", self.path.stem, pid)
+            return False
+        if pid and not self._alive(pid):
+            log.warning("замок остался от мёртвого процесса %d, перехватываем", pid)
+        try:
+            self.path.write_text(
+                json.dumps({"pid": os.getpid(), "started": time.time()}),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            log.error("не удалось занять замок %s: %s", self.path, exc)
+            return False
+        self.acquired = True
+        return True
+
+    def release(self) -> None:
+        if not self.acquired:
+            return
+        if self._holder() == os.getpid():
+            with contextlib.suppress(OSError):
+                self.path.unlink()
+        self.acquired = False
+
+    def __enter__(self) -> InstanceLock:
+        if not self.acquire():
+            raise RuntimeError(f"состояние занято другим процессом: {self.path}")
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.release()
 
 
 def describe(state: PipelineState) -> str:

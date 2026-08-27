@@ -52,7 +52,7 @@ from .ops import (
 from .reputation import ReputationBook
 from .risk import PositionWatcher, RiskManager, Tick
 from .scoring import compute_scores, passes_threshold, weakest_component
-from .state import StateStore
+from .state import InstanceLock, StateStore
 
 log = logging.getLogger("pipeline")
 
@@ -91,6 +91,7 @@ class Pipeline:
         self.metrics = Metrics()
         self.trade_log = TradeLog.from_config(config)
         self.store = store if store is not None else StateStore(config.ops.state_path)
+        self.lock = InstanceLock(config.ops.state_path)
         self.risk = RiskManager(config, store=self.store)
         self.reputation = ReputationBook.load(config.ops.reputation_path)
         self.notifier = Notifier(config.alerts)
@@ -121,7 +122,8 @@ class Pipeline:
         self._started_at = time.time()
         self._last_event_at = time.time()
         self._alerted: dict[str, bool] = {
-            "breaker": False, "halted": False, "stalled": False, "blind": False,
+            "breaker": False, "halted": False, "stalled": False,
+            "blind": False, "cooldown": False,
         }
 
     # -- жизненный цикл ----------------------------------------------------
@@ -174,6 +176,10 @@ class Pipeline:
 
     async def serve(self) -> int:
         """Полный жизненный цикл: старт, работа, аккуратная остановка."""
+        if not self.lock.acquire():
+            log.error("запуск отменён: состояние занято другим процессом. "
+                      "Два бота на одном кошельке перезапишут позиции друг друга")
+            return 2
         install_signal_handlers(self.request_stop)
         self.restore()
         await self.health.start()
@@ -212,6 +218,7 @@ class Pipeline:
         await self.watcher.stop()
         await self.heartbeat.stop()
         await self.health.stop()
+        self.lock.release()
         log.info(
             "остановлено: доделано %d, снято %d, открытых позиций %d, "
             "сделок за день %d, PnL %+.4f SOL, вызовов Grok %d",
@@ -411,6 +418,12 @@ class Pipeline:
                 "поток лончей встал: нет событий из сокета",
                 "поток лончей восстановился",
             ),
+            "cooldown": (
+                bool(status["cooldown_left_seconds"]),
+                f"{self.risk.losing_streak} убытка подряд — пауза на "
+                f"{status['cooldown_left_seconds'] / 60:.0f} мин",
+                "пауза после серии убытков закончилась",
+            ),
             "blind": (
                 bool(status["blind_positions"]),
                 f"нет цен по {status['blind_positions']} открытым позициям — "
@@ -479,6 +492,8 @@ class Pipeline:
             "trades_today": self.risk.trades_today,
             "realized_pnl_sol": round(self.risk.realized_pnl_sol, 6),
             "halted": self.risk.halted,
+            "cooldown_left_seconds": round(self.risk.cooldown_left_seconds, 1),
+            "losing_streak": self.risk.losing_streak,
             "breaker": breaker,
             "grok_budget_remaining": self.grok_ops.budget.remaining,
             "grok_tokens_in": self.grok_ops.tokens_in,

@@ -196,3 +196,66 @@ def test_unreadable_state_does_not_block_start(config, store):
     manager = RiskManager(config, clock=FakeClock(), store=store)
     assert not manager.restore()
     assert manager.evaluate("A", 0.9).approved
+
+
+# --- замок на единственный экземпляр --------------------------------------
+
+
+def test_lock_is_taken_and_released(tmp_path):
+    from src.state import InstanceLock
+
+    lock = InstanceLock(tmp_path / "pipeline.json")
+    assert lock.acquire()
+    assert lock.path.exists()
+    lock.release()
+    assert not lock.path.exists()
+
+
+def test_second_instance_is_refused(tmp_path, monkeypatch):
+    """Два бота на одном состоянии — это два бота на одном кошельке."""
+    import os
+
+    from src.state import InstanceLock
+
+    first = InstanceLock(tmp_path / "pipeline.json")
+    assert first.acquire()
+
+    monkeypatch.setattr(os, "getpid", lambda: os.getppid())   # как будто другой процесс
+    second = InstanceLock(tmp_path / "pipeline.json")
+    assert not second.acquire()
+
+
+def test_stale_lock_is_taken_over(tmp_path):
+    """Падение процесса не должно оставлять систему незапускаемой."""
+    import json as json_module
+
+    from src.state import InstanceLock
+
+    lock = InstanceLock(tmp_path / "pipeline.json")
+    lock.path.parent.mkdir(parents=True, exist_ok=True)
+    lock.path.write_text(json_module.dumps({"pid": 999_999, "started": 1.0}))
+
+    assert lock.acquire()
+
+
+def test_broken_lock_file_does_not_block(tmp_path):
+    from src.state import InstanceLock
+
+    lock = InstanceLock(tmp_path / "pipeline.json")
+    lock.path.parent.mkdir(parents=True, exist_ok=True)
+    lock.path.write_text("не json")
+    assert lock.acquire()
+
+
+def test_lock_context_manager(tmp_path):
+    from src.state import InstanceLock
+
+    with InstanceLock(tmp_path / "pipeline.json") as lock:
+        assert lock.path.exists()
+    assert not lock.path.exists()
+
+
+def test_release_without_acquire_is_safe(tmp_path):
+    from src.state import InstanceLock
+
+    InstanceLock(tmp_path / "pipeline.json").release()
