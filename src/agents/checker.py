@@ -52,6 +52,7 @@ CHECKER_PROMPT = f"""Ты — риск-офицер, который подпис
 
 class CheckerAgent(GrokAgent):
     name: ClassVar[str] = "checker"
+    version: ClassVar[str] = "checker-1"
     prompt: ClassVar[str] = CHECKER_PROMPT
     result_model: ClassVar[type] = CheckerResult
     use_checker_model: ClassVar[bool] = True

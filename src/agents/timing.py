@@ -67,6 +67,7 @@ TIMING_PROMPT = f"""Ты — аналитик рыночного режима д
 
 class TimingAgent(GrokAgent):
     name: ClassVar[str] = "timing"
+    version: ClassVar[str] = "timing-2"
     prompt: ClassVar[str] = TIMING_PROMPT
     result_model: ClassVar[type] = TimingResult
 

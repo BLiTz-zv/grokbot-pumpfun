@@ -50,6 +50,7 @@ confidence, а не оправдывай токен.
 
 class AuditorAgent(GrokAgent):
     name: ClassVar[str] = "auditor"
+    version: ClassVar[str] = "auditor-1"
     prompt: ClassVar[str] = AUDITOR_PROMPT
     result_model: ClassVar[type] = AuditResult
 

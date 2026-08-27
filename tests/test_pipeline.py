@@ -958,3 +958,24 @@ def test_unmatched_intents_pairs_records():
         {"type": "close", "mint": "D"},
     ]
     assert unmatched_intents(records) == ["B"]
+
+
+# --- версии промптов ------------------------------------------------------
+
+
+async def test_buy_records_prompt_versions(config):
+    """Правка промпта меняет поведение агента, а записи выглядят одинаково.
+    Без пометки подбор весов по логу сравнивает двух разных ботов."""
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    await pipeline.process(fresh_token())
+
+    buy = next(r for r in read_log(config.logging.path) if r["type"] == "buy")
+    versions = buy["prompt_versions"]
+    assert set(versions) == {"auditor", "narrative", "timing", "checker"}
+    assert all(value for value in versions.values())
+
+
+def test_prompt_versions_are_distinct(config):
+    versions = Pipeline(config).prompt_versions()
+    assert len(set(versions.values())) == len(versions)

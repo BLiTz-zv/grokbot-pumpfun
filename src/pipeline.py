@@ -345,7 +345,8 @@ class Pipeline:
         self.risk.register_open(position)
         self.reputation.record_open(token.creator)
         self.trade_log.buy(analysis, size_sol=decision.size_sol,
-                           entry_price=result.price, tx_hash=result.tx_hash)
+                           entry_price=result.price, tx_hash=result.tx_hash,
+                           prompt_versions=self.prompt_versions())
         self.metrics.inc("buys")
         self.pulse.record_bought()
         self.metrics.gauge("open_positions", self.risk.open_count)
@@ -437,6 +438,18 @@ class Pipeline:
 
     def _save_reputation(self) -> None:
         self.reputation.save(self.config.ops.reputation_path)
+
+    def prompt_versions(self) -> dict[str, str]:
+        """Версии промптов, с которыми принято это решение.
+
+        Правка промпта меняет поведение агента, а записи в логе выглядят
+        одинаково. Без этой пометки подбор весов по логу сравнивает
+        решения двух разных ботов.
+        """
+        return {
+            agent.name: agent.version
+            for agent in (self.auditor, self.narrative, self.timing, self.checker)
+        }
 
     def _sync_counters(self) -> None:
         """Перенести расход Grok в состояние, которое ляжет на диск."""

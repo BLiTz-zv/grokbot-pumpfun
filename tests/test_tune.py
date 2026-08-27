@@ -163,3 +163,35 @@ def test_main_runs_on_real_shaped_log(tmp_path, monkeypatch, capsys):
     printed = capsys.readouterr().out
     assert "Порог при текущих весах" in printed
     assert "Лучшие 3" in printed
+
+
+# --- версии промптов ------------------------------------------------------
+
+
+def test_mixed_prompt_versions_are_reported(tmp_path, monkeypatch, capsys):
+    records = []
+    for index in range(40):
+        version = "auditor-1" if index < 20 else "auditor-2"
+        mint = f"M{index}"
+        records.append({"type": "buy", "mint": mint, "ts": index,
+                        "scores": scores(total=0.9),
+                        "prompt_versions": {"auditor": version}})
+        records.append({"type": "close", "mint": mint, "pnl_sol": 0.1, "ts": index + 0.5})
+    log = write_log(tmp_path, records)
+    monkeypatch.setattr(sys, "argv", ["tune.py", log, "--top", "2"])
+    tune.main()
+    printed = capsys.readouterr().out
+    assert "разными версиями промптов" in printed
+    assert "auditor-2" in printed
+
+
+def test_single_version_is_not_reported(tmp_path, monkeypatch, capsys):
+    records = [
+        {"type": "buy", "mint": "A", "ts": 1, "scores": scores(total=0.9),
+         "prompt_versions": {"auditor": "auditor-1"}},
+        {"type": "close", "mint": "A", "pnl_sol": 0.1, "ts": 2},
+    ]
+    log = write_log(tmp_path, records)
+    monkeypatch.setattr(sys, "argv", ["tune.py", log])
+    tune.main()
+    assert "разными версиями" not in capsys.readouterr().out

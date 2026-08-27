@@ -36,6 +36,10 @@ class GrokAgent:
     """Один агент = один промпт + одна pydantic-схема ответа."""
 
     name: ClassVar[str] = "agent"
+    # Версия промпта. Меняется вместе с текстом промпта и попадает в лог:
+    # без неё нельзя сравнивать статистику до и после его правки — это
+    # разные бота, а выглядят как один.
+    version: ClassVar[str] = "0"
     prompt: ClassVar[str] = ""            # системный промпт, константа модуля агента
     result_model: ClassVar[type[BaseModel]] = BaseModel
     use_checker_model: ClassVar[bool] = False

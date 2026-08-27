@@ -43,6 +43,7 @@ NARRATIVE_PROMPT = f"""Ты — аналитик мем-культуры кри�
 
 class NarrativeAgent(GrokAgent):
     name: ClassVar[str] = "narrative"
+    version: ClassVar[str] = "narrative-1"
     prompt: ClassVar[str] = NARRATIVE_PROMPT
     result_model: ClassVar[type] = NarrativeResult
 

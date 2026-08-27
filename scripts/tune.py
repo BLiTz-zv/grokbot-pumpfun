@@ -77,6 +77,19 @@ def load_candidates(path: str, rotated: bool) -> list[Candidate]:
     return candidates
 
 
+def prompt_versions_in(path: str, rotated: bool) -> set[str]:
+    """Наборы версий промптов, встреченные в логе покупок."""
+    source = TradeLog(path).read_all() if rotated else read_log(path)
+    found: set[str] = set()
+    for record in source:
+        if record.get("type") != "buy":
+            continue
+        versions = record.get("prompt_versions") or {}
+        if versions:
+            found.add(", ".join(f"{k}={v}" for k, v in sorted(versions.items())))
+    return found
+
+
 def total(parts: tuple[float, ...], weights: tuple[float, ...]) -> float:
     return sum(part * weight for part, weight in zip(parts, weights, strict=True))
 
@@ -162,6 +175,14 @@ def main() -> int:
     if not candidates:
         print(f"В {args.log} нет записей со скорингом — подбирать не на чем.")
         return 1
+
+    versions = prompt_versions_in(args.log, args.rotated)
+    if len(versions) > 1:
+        print("\n  ОСТОРОЖНО: в логе решения, принятые с разными версиями промптов:")
+        for version in sorted(versions):
+            print(f"    {version}")
+        print("  Это записи разных ботов. Веса, подобранные на такой смеси,")
+        print("  не относятся ни к одному из них.")
 
     closed = [c for c in candidates if c.pnl_sol is not None]
     weights = current_weights(args.config)

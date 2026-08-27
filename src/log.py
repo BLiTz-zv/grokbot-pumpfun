@@ -117,6 +117,7 @@ class TradeLog:
         size_sol: float,
         entry_price: float,
         tx_hash: str,
+        prompt_versions: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         token = analysis.token
         return self._write(
@@ -134,6 +135,7 @@ class TradeLog:
                 "timing": analysis.timing.model_dump() if analysis.timing else None,
                 "checker": analysis.checker.model_dump() if analysis.checker else None,
                 "metrics": analysis.metrics.model_dump(),
+                "prompt_versions": prompt_versions or {},
                 "token": {
                     "age_seconds": round(token.age_seconds),
                     "unique_buyers": token.unique_buyers,
