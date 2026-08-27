@@ -787,3 +787,73 @@ async def test_entry_price_includes_slippage(config):
     assert buy["entry_price"] > spot
     assert buy["metrics"]["round_trip_cost_pct"] > 0
     assert buy["metrics"]["curve_liquidity_sol"] == pytest.approx(15.0)
+
+
+# --- данные для агента-тайминга -------------------------------------------
+
+
+async def test_timing_agent_gets_measured_data(config):
+    """Агент рынка должен видеть наблюдения, а не внутренние счётчики."""
+    captured: list[dict] = []
+
+    def grok_handler_capturing(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        system = body["messages"][0]["content"]
+        if "рыночного режима" in system:
+            captured.append(json.loads(body["messages"][1]["content"]))
+            return httpx.Response(200, json={"choices": [{"message": {"content": GOOD_TIMING}}]})
+        content = {"форензик": GOOD_AUDIT, "мем-культуры": GOOD_NARRATIVE,
+                   "риск-офицер": APPROVE}
+        for marker, answer in content.items():
+            if marker in system:
+                return httpx.Response(200, json={"choices": [{"message": {"content": answer}}]})
+        raise AssertionError("неизвестный агент")
+
+    pipeline = Pipeline(config)
+    grok = httpx.AsyncClient(transport=httpx.MockTransport(grok_handler_capturing))
+    for agent in (pipeline.auditor, pipeline.narrative, pipeline.timing, pipeline.checker):
+        agent._client = grok
+    data = httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(data_handler))
+    pipeline.analyzer._client = data
+    pipeline.executor._client = data
+
+    for index in range(10):
+        pipeline.pulse.record_launch(35.0 + index)
+    await pipeline.process(fresh_token())
+
+    assert captured, "тайминг-агента не спросили"
+    наблюдения = captured[0]["наблюдения"]
+    assert наблюдения["лончей_в_окне"] >= 10
+    assert наблюдения["медиана_sol_в_кривой"] > 30
+    assert "час_utc" in наблюдения
+    assert наблюдения["данных_мало"] is False
+
+
+async def test_pulse_counts_launches_and_outcomes(config):
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+
+    pipeline._log_monitor_skip(fresh_token(), "few_buyers")     # отсеянный лонч
+    await pipeline.process(fresh_token())                        # дожил до разбора
+    assert pipeline.pulse.snapshot()["лончей_в_окне"] == 1
+    assert pipeline.pulse.snapshot()["покупок_в_окне"] == 1
+
+    position = pipeline.risk.positions["Mint1111"]
+    move_price(0.05)
+    await pipeline._sell(position, price=await pipeline._price(position.mint),
+                         reason="stop_loss")
+    assert pipeline.pulse.snapshot()["доля_сливов"] == pytest.approx(1.0)
+
+
+async def test_outcomes_restored_after_restart(config):
+    first = Pipeline(config)
+    wire(first, APPROVE)
+    await first.process(fresh_token())
+    position = first.risk.positions["Mint1111"]
+    move_price(0.05)
+    await first._sell(position, price=await first._price(position.mint), reason="stop_loss")
+    await first.shutdown()
+
+    second = Pipeline(config)
+    second.restore()
+    assert second.pulse.snapshot()["закрытых_сделок_в_памяти"] == 1

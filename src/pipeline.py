@@ -36,7 +36,8 @@ from .alerts import Notifier
 from .analyzer import Analyzer, compute_metrics, enrich_token
 from .curve import max_sol_for_impact, state_from_any
 from .executor import BaseExecutor, build_executor, new_position
-from .log import TradeLog, setup_logging
+from .log import TradeLog, read_log, setup_logging
+from .market import MarketPulse
 from .models import Analysis, Config, ConfigError, Position, Token
 from .monitor import LaunchMonitor
 from .ops import (
@@ -74,6 +75,7 @@ class Pipeline:
         self.risk = RiskManager(config, store=self.store)
         self.reputation = ReputationBook.load(config.ops.reputation_path)
         self.notifier = Notifier(config.alerts)
+        self.pulse = MarketPulse()
         self.grok_ops = GrokOps(config, self.metrics)
 
         self._grok_client = httpx.AsyncClient(
@@ -123,7 +125,16 @@ class Pipeline:
         await self._grok_client.aclose()
 
     def restore(self) -> None:
-        """Поднять состояние прошлого запуска: позиции, лимиты дня, репутацию."""
+        """Поднять состояние прошлого запуска: позиции, лимиты дня, репутацию.
+
+        Исходы прошлых сделок тоже поднимаются: агент-тайминг не должен
+        после каждого рестарта считать, что история пуста.
+        """
+        seeded = self.pulse.seed_from_log(
+            read_log(self.config.logging.path), self.config.filter.rug_loss_pct
+        )
+        if seeded:
+            log.info("в память рынка поднято %d прошлых исходов", seeded)
         forgotten = self.reputation.forget_older_than(self.config.filter.forget_creators_after_days)
         log.info("книга репутации: %s%s", self.reputation.summary(),
                  f", забыто устаревших {forgotten}" if forgotten else "")
@@ -198,6 +209,7 @@ class Pipeline:
         async for token in self.monitor.stream():
             self._last_event_at = time.time()
             self.metrics.inc("tokens_seen")
+            self.pulse.record_launch(token.sol_in_curve)
             self._check_transitions()
             if self._stopping.is_set():
                 break
@@ -228,6 +240,7 @@ class Pipeline:
         log.info("разбираем %s (%s), покупателей %d",
                  token.symbol or "?", token.mint[:8], token.unique_buyers)
         self.reputation.observe(token.creator)
+        self.pulse.record_passed()
 
         # 1.5. Память о создателе. Бесплатная ступень перед всеми платными:
         # адрес, который уже сливал, дальше не идёт.
@@ -306,6 +319,7 @@ class Pipeline:
         self.trade_log.buy(analysis, size_sol=decision.size_sol,
                            entry_price=result.price, tx_hash=result.tx_hash)
         self.metrics.inc("buys")
+        self.pulse.record_bought()
         self.metrics.gauge("open_positions", self.risk.open_count)
         log.info("КУПЛЕНО %s на %.4f SOL, score %.3f, tx %s",
                  token.symbol or token.mint[:8], decision.size_sol,
@@ -430,16 +444,20 @@ class Pipeline:
         }
 
     def _market_snapshot(self) -> dict[str, Any]:
-        """Что пайплайн знает о рынке сам — уходит тайминг-агенту как контекст."""
-        return {
-            "pending_launches": len(self.monitor.pending),
-            "open_positions": self.risk.open_count,
-            "trades_today": self.risk.trades_today,
-            "realized_pnl_sol": round(self.risk.realized_pnl_sol, 4),
-        }
+        """Наблюдения, уходящие тайминг-агенту. Только измеренное."""
+        data = self.pulse.snapshot()
+        data.update({
+            "лончей_в_буфере": len(self.monitor.pending),
+            "открытых_позиций": self.risk.open_count,
+            "сделок_сегодня": self.risk.trades_today,
+            "pnl_за_день_sol": round(self.risk.realized_pnl_sol, 4),
+            "данных_мало": self.pulse.is_thin(),
+        })
+        return data
 
     def _log_monitor_skip(self, token: Token, reason: str) -> None:
         self.metrics.inc("skip_monitor")
+        self.pulse.record_launch(token.sol_in_curve)
         self.trade_log.skip(token, stage="monitor", reason=reason)
 
     async def _price(self, mint: str) -> float:
@@ -488,6 +506,7 @@ class Pipeline:
                 rug_loss_pct=self.config.filter.rug_loss_pct,
             )
             self._save_reputation()
+            self.pulse.record_outcome(change_pct, self.config.filter.rug_loss_pct)
         else:
             position.token_amount -= sold
             position.sol_spent -= cost_basis
