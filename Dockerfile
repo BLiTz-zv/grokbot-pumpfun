@@ -38,5 +38,5 @@ sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz',timeout=
 # SIGTERM пайплайн обрабатывает сам: доделывает начатое и сохраняет состояние.
 STOPSIGNAL SIGTERM
 
-ENTRYPOINT ["python", "-m", "src.pipeline"]
-CMD ["--config", "/app/config/config.yaml"]
+ENTRYPOINT ["python", "-m", "src.cli"]
+CMD ["run", "--config", "/app/config/config.yaml"]

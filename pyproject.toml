@@ -29,7 +29,7 @@ dev = [
 ]
 
 [project.scripts]
-grokbot = "src.pipeline:main"
+grokbot = "src.cli:main"
 
 [project.urls]
 Repository = "https://github.com/zostaff/grokbot-pumpfun"

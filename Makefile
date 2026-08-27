@@ -1,4 +1,4 @@
-.PHONY: help install dev test cov lint fmt types check run check-config dashboard replay tune docker clean
+.PHONY: help install dev test cov lint fmt types check run check-config doctor curve dashboard replay tune docker clean
 
 PY ?= python3
 VENV ?= .venv
@@ -35,10 +35,16 @@ types:           ## mypy
 check: lint types test  ## всё, что гоняет CI
 
 check-config:    ## проверить конфиг, ничего не запуская
-	$(BIN)/python -m src.pipeline --config $(CONFIG) --check
+	$(BIN)/python -m src.cli check --config $(CONFIG)
+
+doctor:          ## предполётная проверка окружения
+	$(BIN)/python -m src.cli doctor --config $(CONFIG)
+
+curve:           ## во что обходится сделка на кривой
+	$(BIN)/python -m src.cli curve
 
 run:             ## запустить пайплайн (режим берётся из конфига)
-	$(BIN)/python -m src.pipeline --config $(CONFIG)
+	$(BIN)/python -m src.cli run --config $(CONFIG)
 
 dashboard:       ## живой дашборд по логу
 	$(BIN)/python scripts/dashboard.py $(LOG) --watch 5
