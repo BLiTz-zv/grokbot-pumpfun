@@ -20,6 +20,19 @@ from src.log import TradeLog, read_log
 
 BUCKETS = [(0.0, 0.5), (0.5, 0.6), (0.6, 0.7), (0.7, 0.8), (0.8, 0.9), (0.9, 1.01)]
 
+# Ступени в том порядке, в каком их проходит токен. По ним строится воронка:
+# видно, где именно кончается поток и какая ступень фактически решает.
+STAGES = [
+    ("monitor", "монитор"),
+    ("reputation", "память о создателях"),
+    ("analyzer", "анализатор"),
+    ("scoring", "скоринг"),
+    ("checker", "чекер"),
+    ("risk", "риск-гейт"),
+    ("executor", "исполнение"),
+    ("pipeline", "сбои обработки"),
+]
+
 
 def parse_since(value: str | None) -> float:
     if not value:
@@ -88,6 +101,28 @@ def main() -> int:
             print(f"  [{stage}]  {stage_total}")
             for reason, count in by_stage[stage].most_common():
                 print(f"      {reason[:28]:<28} {count:>5}  {bar(count, len(skips))}")
+
+    # -- воронка -----------------------------------------------------------
+    if skips or buys:
+        print("\nВоронка")
+        by_stage_count = Counter(r.get("stage", "?") for r in skips)
+        remaining = seen
+        rows = [("рассмотрено", remaining, "", "")]
+        for stage, label in STAGES:
+            dropped = by_stage_count.get(stage, 0)
+            if not dropped:
+                continue                       # ступень никого не отсеяла
+            remaining -= dropped
+            share = f"{remaining / seen * 100:5.1f}%" if seen else ""
+            rows.append((f"после «{label}»", remaining, share, f"−{dropped}"))
+        rows.append(("куплено", len(buys),
+                     f"{len(buys) / seen * 100:5.1f}%" if seen else "", ""))
+        width = max(len(name) for name, _, _, _ in rows)
+        for name, count, share, dropped in rows:
+            print(f"  {name:<{width}}  {count:>6}  {share:>7}  {dropped:>7}")
+        unknown = set(by_stage_count) - {stage for stage, _ in STAGES}
+        if unknown:
+            print(f"  (ступени вне порядка: {', '.join(sorted(unknown))})")
 
     # -- скоринг -----------------------------------------------------------
     scored = [r for r in records if (r.get("scores") or {}).get("total") is not None]
