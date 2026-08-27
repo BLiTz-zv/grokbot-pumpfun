@@ -34,6 +34,7 @@ import httpx
 from .agents import AuditorAgent, CheckerAgent, NarrativeAgent, TimingAgent
 from .alerts import Notifier
 from .analyzer import Analyzer, compute_metrics, enrich_token
+from .curve import max_sol_for_impact, state_from_any
 from .executor import BaseExecutor, build_executor, new_position
 from .log import TradeLog, setup_logging
 from .models import Analysis, Config, ConfigError, Position, Token
@@ -238,8 +239,12 @@ class Pipeline:
         # 2. Анализатор: сеть параллельно, метрики кодом.
         info, holders, trades = await self.analyzer.fetch(token.mint)
         enrich_token(token, info)
-        metrics = compute_metrics(token, holders, trades)
-        analysis = Analysis(token=token, metrics=metrics)
+        curve = state_from_any(info, token.market_cap_sol)
+        metrics = compute_metrics(
+            token, holders, trades, curve, self.config.market,
+            planned_sol=self.config.risk.max_sol_per_trade,
+        )
+        analysis = Analysis(token=token, metrics=metrics, curve=curve)
 
         ok, reason = self.analyzer.passes(metrics)
         if not ok:
@@ -269,8 +274,14 @@ class Pipeline:
                 detail=f"{analysis.checker.reason} [{', '.join(analysis.checker.flags)}]",
             )
 
-        # 8. Риск-гейт.
-        decision = self.risk.evaluate(token.mint, analysis.scores.total)
+        # 8. Риск-гейт. Потолок по ликвидности считается до размера позиции:
+        # заявка, двигающая цену на проценты, съедает своё же движение.
+        liquidity_cap = (
+            max_sol_for_impact(curve, self.config.market.max_price_impact_pct,
+                               self.config.market.trade_fee_pct)
+            if curve else 0.0
+        )
+        decision = self.risk.evaluate(token.mint, analysis.scores.total, liquidity_cap)
         if not decision.approved:
             return self._reject(analysis, stage="risk", reason=decision.reason)
 
@@ -434,32 +445,61 @@ class Pipeline:
     async def _price(self, mint: str) -> float:
         return await self.executor.price(mint)
 
-    async def _sell(self, position: Position, price: float, reason: str = "stop_loss") -> None:
-        """Выход из позиции: продать, посчитать PnL, записать в лог."""
+    async def _sell(
+        self,
+        position: Position,
+        price: float,
+        reason: str = "stop_loss",
+        fraction: float = 1.0,
+    ) -> None:
+        """Выход из позиции целиком или частью: продать, посчитать, записать.
+
+        Себестоимость делится пропорционально проданным токенам, поэтому
+        частичная фиксация не искажает результат оставшегося хвоста.
+        """
         try:
-            result = await self.executor.sell(position)
+            result = await self.executor.sell(position, fraction)
         except NotImplementedError as exc:
             log.error("продажа не реализована, позиция %s остаётся открытой: %s",
                       position.mint[:8], exc)
             self.metrics.inc("sell_not_implemented")
             return
-        proceeds = result.sol_amount if result.ok else position.token_amount * price
-        pnl = proceeds - position.sol_spent
+
+        tokens_before = position.token_amount or 1.0
+        sold = result.token_amount if result.ok else tokens_before * fraction
+        share = max(0.0, min(1.0, sold / tokens_before))
+        final = share >= 0.999
+
+        proceeds = result.sol_amount if result.ok else sold * price
+        cost_basis = position.sol_spent * share
+        pnl = proceeds - cost_basis
         exit_price = result.price or price
         change_pct = (
             (exit_price - position.entry_price) / position.entry_price * 100.0
             if position.entry_price else 0.0
         )
+
         self._sync_counters()
-        self.risk.register_close(position.mint, pnl_sol=pnl)
-        self.reputation.record_close(
-            position.creator, pnl_sol=pnl, pnl_pct=change_pct,
-            rug_loss_pct=self.config.filter.rug_loss_pct,
-        )
-        self._save_reputation()
-        self.trade_log.close(position, exit_price=result.price or price,
-                             pnl_sol=pnl, reason=reason, tx_hash=result.tx_hash)
-        self.metrics.inc("closes")
+        if final:
+            total_pnl = pnl + position.realized_sol - (position.sol_spent - cost_basis)
+            self.risk.register_close(position.mint, pnl_sol=pnl)
+            self.reputation.record_close(
+                position.creator, pnl_sol=total_pnl, pnl_pct=change_pct,
+                rug_loss_pct=self.config.filter.rug_loss_pct,
+            )
+            self._save_reputation()
+        else:
+            position.token_amount -= sold
+            position.sol_spent -= cost_basis
+            position.realized_sol += proceeds
+            position.partials += 1
+            self.risk.register_partial(position.mint, pnl_sol=pnl)
+            log.info("частично закрыто %s: %.0f%% позиции, осталось %.4f SOL себестоимости",
+                     position.mint[:8], share * 100, position.sol_spent)
+
+        self.trade_log.close(position, exit_price=exit_price, pnl_sol=pnl, reason=reason,
+                             tx_hash=result.tx_hash, fraction=share, final=final)
+        self.metrics.inc("closes" if final else "partial_closes")
         self.metrics.inc(f"exit_{reason}")
         self.metrics.gauge("open_positions", self.risk.open_count)
         log.info("ЗАКРЫТО %s по правилу %s, PnL %+.4f SOL", position.mint[:8], reason, pnl)
@@ -470,7 +510,7 @@ class Pipeline:
             mint=position.mint, reason=reason, pnl_sol=round(pnl, 6),
             pnl_pct=round(change_pct, 2),
         )
-        if -change_pct >= self.config.filter.rug_loss_pct:
+        if final and -change_pct >= self.config.filter.rug_loss_pct:
             self.notifier.notify(
                 "rug",
                 f"создатель {(position.creator or '?')[:8]} слил "

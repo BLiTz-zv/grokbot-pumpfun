@@ -158,6 +158,8 @@ class TradeLog:
         pnl_sol: float,
         reason: str,
         tx_hash: str = "",
+        fraction: float = 1.0,
+        final: bool = True,
     ) -> dict[str, Any]:
         held = max(0.0, time.time() - position.opened_at) if position.opened_at else 0.0
         pnl_pct = (
@@ -177,6 +179,8 @@ class TradeLog:
                 "pnl_pct": round(pnl_pct, 2),
                 "hold_seconds": round(held, 1),
                 "reason": reason,
+                "fraction": round(fraction, 4),
+                "final": final,
                 "tx_hash": tx_hash,
                 "score": position.score,
             }

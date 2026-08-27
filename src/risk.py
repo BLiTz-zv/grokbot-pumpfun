@@ -140,13 +140,23 @@ class RiskManager:
 
     # -- решение -----------------------------------------------------------
 
-    def position_size(self, score: float) -> float:
-        """Размер позиции: пропорционален скорингу, ограничен сверху дважды."""
+    def position_size(self, score: float, liquidity_cap: float | None = None) -> float:
+        """Размер позиции: пропорционален скорингу, ограничен сверху трижды.
+
+        Третий потолок — ликвидность кривой. Заявка, двигающая цену на
+        проценты, покупает сама у себя: часть ожидаемого движения уходит
+        на собственное проскальзывание ещё до того, как рынок что-то решит.
+        """
         by_score = self.risk.max_sol_per_trade * max(0.0, min(1.0, score))
         by_budget = self.remaining_loss_budget * MAX_SHARE_OF_REMAINING_BUDGET
-        return round(min(by_score, by_budget), 6)
+        limits = [by_score, by_budget]
+        if liquidity_cap is not None and liquidity_cap > 0:
+            limits.append(liquidity_cap)
+        return round(min(limits), 6)
 
-    def evaluate(self, mint: str, score: float) -> TradeDecision:
+    def evaluate(
+        self, mint: str, score: float, liquidity_cap: float | None = None
+    ) -> TradeDecision:
         """Пропустить сделку или нет, и на какую сумму."""
         self.roll_day_if_needed()
 
@@ -168,7 +178,7 @@ class RiskManager:
         if mint in self.positions:
             return TradeDecision(approved=False, reason="already_open")
 
-        size = self.position_size(score)
+        size = self.position_size(score, liquidity_cap)
         if size < MIN_TRADE_SOL:
             return TradeDecision(
                 approved=False,
@@ -183,6 +193,11 @@ class RiskManager:
         self.roll_day_if_needed()
         self.positions[position.mint] = position
         self.trades_today += 1
+        self.persist()
+
+    def register_partial(self, mint: str, pnl_sol: float) -> None:
+        """Частичный выход: деньги в дневной итог, позиция остаётся открытой."""
+        self.realized_pnl_sol += pnl_sol
         self.persist()
 
     def register_close(self, mint: str, pnl_sol: float) -> Position | None:
@@ -217,10 +232,11 @@ EXIT_REASONS = ("stop_loss", "take_profit", "trailing_stop", "max_hold")
 
 
 class ExitSignal(BaseModel):
-    """Причина закрыть позицию и то, чем она обоснована."""
+    """Причина выйти, обоснование и какую долю позиции продать."""
 
     reason: str
     detail: str = ""
+    fraction: float = 1.0
 
 
 def pnl_pct(position: Position, price: float) -> float:
@@ -255,8 +271,15 @@ def exit_signal(
     if risk.stop_loss_pct and -change >= risk.stop_loss_pct:
         return ExitSignal(reason="stop_loss", detail=f"{change:+.1f}% от входа")
 
-    if risk.take_profit_pct and change >= risk.take_profit_pct:
-        return ExitSignal(reason="take_profit", detail=f"{change:+.1f}% от входа")
+    # Первый take-profit может быть частичным: забрать основное и оставить
+    # хвост трейлингу. Повторно правило не срабатывает — иначе позиция
+    # распродавалась бы по кусочку на каждом тике.
+    if risk.take_profit_pct and change >= risk.take_profit_pct and position.partials == 0:
+        return ExitSignal(
+            reason="take_profit",
+            detail=f"{change:+.1f}% от входа",
+            fraction=max(0.0, min(1.0, risk.take_profit_fraction)),
+        )
 
     # Трейлинг работает только выше входа: ниже за позицию отвечает стоп-лосс,
     # иначе два правила спорили бы за одну и ту же просадку.
@@ -300,7 +323,7 @@ class PositionWatcher:
         self,
         manager: RiskManager,
         price_fn: Callable[[str], Awaitable[float]],
-        sell_fn: Callable[[Position, float, str], Awaitable[None]],
+        sell_fn: Callable[[Position, float, str, float], Awaitable[None]],
     ) -> None:
         self.manager = manager
         self.price_fn = price_fn
@@ -340,11 +363,13 @@ class PositionWatcher:
             if signal is None:
                 continue
 
-            log.info("выход из %s по правилу %s (%s): вход %.12f, сейчас %.12f",
+            log.info("выход из %s по правилу %s (%s), доля %.0f%%: "
+                     "вход %.12f, сейчас %.12f",
                      position.mint[:8], signal.reason, signal.detail,
-                     position.entry_price, price)
-            await self.sell_fn(position, price, signal.reason)
-            triggered.append(position.mint)
+                     signal.fraction * 100, position.entry_price, price)
+            await self.sell_fn(position, price, signal.reason, signal.fraction)
+            if position.mint not in self.manager.positions:
+                triggered.append(position.mint)
             persist_needed = False        # продажа сохранит состояние сама
 
         if persist_needed:

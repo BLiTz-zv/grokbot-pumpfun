@@ -22,12 +22,12 @@ from typing import Any
 
 import websockets
 
+from .curve import CURVE_COMPLETION_SOL, progress_from_sol
 from .models import Config, FilterConfig, Token
 
 log = logging.getLogger(__name__)
 
-# Кривая pump.fun считается заполненной примерно на 85 SOL в резерве.
-CURVE_COMPLETION_SOL = 85.0
+__all__ = ["CURVE_COMPLETION_SOL", "LaunchMonitor", "parse_create_event", "passes_filter"]
 
 # Сколько держать лонч в буфере, если он так и не набрал покупателей.
 PENDING_TTL_SECONDS = 900.0
@@ -88,7 +88,9 @@ def parse_create_event(payload: dict[str, Any]) -> Token | None:
         created_timestamp=created_ts,
         sol_in_curve=sol_in_curve,
         market_cap_sol=float(payload.get("marketCapSol") or 0.0),
-        curve_progress=min(1.0, sol_in_curve / CURVE_COMPLETION_SOL),
+        # Резерв, который отдаёт сокет, включает 30 виртуальных SOL: они
+        # лежат в кривой с рождения и прогрессом не являются.
+        curve_progress=progress_from_sol(sol_in_curve),
     )
 
 
@@ -155,7 +157,7 @@ class LaunchMonitor:
         sol_in_curve = payload.get("vSolInBondingCurve")
         if sol_in_curve is not None:
             token.sol_in_curve = float(sol_in_curve)
-            token.curve_progress = min(1.0, token.sol_in_curve / CURVE_COMPLETION_SOL)
+            token.curve_progress = progress_from_sol(token.sol_in_curve)
         if payload.get("marketCapSol") is not None:
             token.market_cap_sol = float(payload["marketCapSol"])
 

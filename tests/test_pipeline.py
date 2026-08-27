@@ -51,17 +51,19 @@ REJECT = json.dumps({"approve": False, "reason": "органика не бьёт
 
 
 # Резервы кривой в моке — изменяемые: через них тесты роняют цену.
-CURVE = {"sol": 30_000_000_000, "tokens": 900_000_000_000_000}
+# 45 SOL виртуальных = 15 реальных, k сохранён: кривая живая и торгуемая.
+LIVE_CURVE = (45_000_000_000, 715_333_460_666_667)
+CURVE = {"sol": LIVE_CURVE[0], "tokens": LIVE_CURVE[1]}
 
 
 @pytest.fixture(autouse=True)
 def _reset_curve():
-    CURVE["sol"], CURVE["tokens"] = 30_000_000_000, 900_000_000_000_000
+    CURVE["sol"], CURVE["tokens"] = LIVE_CURVE
     yield
 
 
-def crash_price(factor: float) -> None:
-    """Обвалить цену в `factor` раз относительно текущей."""
+def move_price(factor: float) -> None:
+    """Сдвинуть цену в `factor` раз: меньше единицы — обвал, больше — рост."""
     CURVE["sol"] = int(CURVE["sol"] * factor)
 
 
@@ -449,7 +451,7 @@ async def test_creator_who_rugged_is_blocked_next_time(config):
     await pipeline.process(fresh_token())
     position = pipeline.risk.positions["Mint1111"]
 
-    crash_price(0.1)                      # токен сложился в десять раз
+    move_price(0.1)                      # токен сложился в десять раз
     await pipeline._sell(position, price=await pipeline._price(position.mint),
                          reason="stop_loss")
     assert pipeline.reputation.creators["Creator1"].rugs == 1
@@ -470,7 +472,7 @@ async def test_blocklist_survives_restart(config):
     wire(first, APPROVE)
     await first.process(fresh_token())
     position = first.risk.positions["Mint1111"]
-    crash_price(0.05)
+    move_price(0.05)
     await first._sell(position, price=await first._price(position.mint), reason="stop_loss")
     await first.shutdown()
 
@@ -504,7 +506,7 @@ async def test_moderate_loss_does_not_blacklist(config):
     await pipeline.process(fresh_token())
     position = pipeline.risk.positions["Mint1111"]
 
-    crash_price(0.75)                     # минус 25%: неприятно, но не слив
+    move_price(0.75)                     # минус 25%: неприятно, но не слив
     await pipeline._sell(position, price=await pipeline._price(position.mint),
                          reason="stop_loss")
     assert pipeline.reputation.creators["Creator1"].rugs == 0
@@ -518,10 +520,11 @@ async def test_reputation_can_be_switched_off(config):
     wire(pipeline, APPROVE)
     await pipeline.process(fresh_token())
     position = pipeline.risk.positions["Mint1111"]
-    crash_price(0.05)
+    move_price(0.05)
     await pipeline._sell(position, price=await pipeline._price(position.mint),
                          reason="stop_loss")
 
+    CURVE["sol"] = LIVE_CURVE[0]           # у другого токена своя кривая
     другой = fresh_token()
     другой.mint = "Mint5555"
     assert await pipeline.process(другой) is not None      # куплен, несмотря на слив
@@ -570,7 +573,7 @@ async def test_rug_is_announced_separately_from_close(config):
     await pipeline.process(fresh_token())
     position = pipeline.risk.positions["Mint1111"]
 
-    crash_price(0.05)
+    move_price(0.05)
     await pipeline._sell(position, price=await pipeline._price(position.mint),
                          reason="stop_loss")
     await pipeline.notifier.aclose()
@@ -588,7 +591,7 @@ async def test_ordinary_loss_is_not_announced_as_rug(config):
     await pipeline.process(fresh_token())
     position = pipeline.risk.positions["Mint1111"]
 
-    crash_price(0.8)
+    move_price(0.8)
     await pipeline._sell(position, price=await pipeline._price(position.mint),
                          reason="stop_loss")
     await pipeline.notifier.aclose()
@@ -634,9 +637,9 @@ async def test_alerts_off_by_default(config):
 # --- покупка без цены -----------------------------------------------------
 
 
-async def test_buy_without_price_is_refused(config):
-    """Позиция с нулевой ценой входа неуправляема: ни одно правило выхода
-    на ней не срабатывает, и она висела бы открытой вечно."""
+async def test_token_without_curve_data_is_refused(config):
+    """Позиция с неизвестной ценой входа неуправляема: ни одно правило
+    выхода на ней не срабатывает, и она висела бы открытой вечно."""
     pipeline = Pipeline(config)
     wire(pipeline, APPROVE)
     CURVE["sol"] = 0                                # провайдер не отдал резервы
@@ -646,8 +649,21 @@ async def test_buy_without_price_is_refused(config):
     assert await pipeline.process(без_цены) is None
     assert pipeline.risk.open_count == 0
     records = list(read_log(config.logging.path))
-    assert records[-1]["stage"] == "executor"
-    assert records[-1]["reason"] == "execution_failed"
+    assert records[-1]["stage"] == "analyzer"
+    assert records[-1]["reason"] == "curve_too_thin"
+
+
+async def test_thin_curve_is_refused(config):
+    """Из кривой на пару SOL не выйти: своя же продажа обвалит цену."""
+    config.market.min_curve_liquidity_sol = 5.0
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    CURVE["sol"] = 32_000_000_000                   # всего 2 реальных SOL
+
+    assert await pipeline.process(fresh_token()) is None
+    records = list(read_log(config.logging.path))
+    assert records[-1]["reason"] == "curve_too_thin"
+    assert pipeline.grok_ops.budget.spent == 0      # до агентов дело не дошло
 
 
 async def test_blind_position_degrades_health(config):
@@ -673,3 +689,101 @@ async def test_blind_position_is_announced(config):
     blind = [e for e in seen if e["event"] == "blind"]
     assert len(blind) == 1
     assert "не работают" in blind[0]["text"]
+
+
+# --- частичная фиксация прибыли -------------------------------------------
+
+
+async def test_partial_take_profit_keeps_the_tail(config):
+    """Забрать основное и оставить хвост трейлингу — весь смысл частичного
+    выхода. Позиция обязана остаться открытой и с уменьшенной себестоимостью."""
+    config.risk.take_profit_pct = 50.0
+    config.risk.take_profit_fraction = 0.6
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    await pipeline.process(fresh_token())
+    position = pipeline.risk.positions["Mint1111"]
+    spent_before, tokens_before = position.sol_spent, position.token_amount
+
+    move_price(2.0)
+    assert await pipeline.watcher.check_once() == []      # закрыта не целиком
+
+    assert "Mint1111" in pipeline.risk.positions
+    assert position.partials == 1
+    assert position.token_amount == pytest.approx(tokens_before * 0.4)
+    assert position.sol_spent == pytest.approx(spent_before * 0.4, rel=0.01)  # осталась
+    assert position.realized_sol > 0
+    assert pipeline.risk.realized_pnl_sol > 0
+
+    closes = [r for r in read_log(config.logging.path) if r["type"] == "close"]
+    assert len(closes) == 1
+    assert closes[0]["final"] is False
+    assert closes[0]["fraction"] == pytest.approx(0.6)
+    assert closes[0]["reason"] == "take_profit"
+
+
+async def test_tail_closes_and_reputation_счётся_once(config):
+    config.risk.take_profit_pct = 50.0
+    config.risk.take_profit_fraction = 0.6
+    config.risk.trailing_stop_pct = 30.0
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    await pipeline.process(fresh_token())
+
+    move_price(2.0)
+    await pipeline.watcher.check_once()                   # частичная фиксация
+    move_price(0.5)                                       # откат от пика
+    closed = await pipeline.watcher.check_once()
+
+    assert closed == ["Mint1111"]
+    assert pipeline.risk.open_count == 0
+    assert pipeline.reputation.creators["Creator1"].closed == 1   # один раз, не два
+
+    closes = [r for r in read_log(config.logging.path) if r["type"] == "close"]
+    assert [r["final"] for r in closes] == [False, True]
+
+
+async def test_partial_profit_survives_restart(config):
+    config.risk.take_profit_pct = 50.0
+    config.risk.take_profit_fraction = 0.5
+    first = Pipeline(config)
+    wire(first, APPROVE)
+    await first.process(fresh_token())
+    move_price(2.0)
+    await first.watcher.check_once()
+    await first.shutdown()
+
+    second = Pipeline(config)
+    second.restore()
+    restored = second.risk.positions["Mint1111"]
+    assert restored.partials == 1
+    assert restored.realized_sol > 0
+    assert second.risk.realized_pnl_sol == pytest.approx(first.risk.realized_pnl_sol)
+
+
+async def test_position_size_capped_by_liquidity(config):
+    """На тонкой кривой заявка режется потолком влияния, а не скорингом."""
+    config.risk.max_sol_per_trade = 5.0
+    config.market.max_price_impact_pct = 3.0
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    await pipeline.process(fresh_token())
+
+    position = pipeline.risk.positions["Mint1111"]
+    assert position.sol_spent < 2.0            # 45 SOL резерва не дают взять пять
+    buys = [r for r in read_log(config.logging.path) if r["type"] == "buy"]
+    assert buys[0]["size_sol"] == pytest.approx(position.sol_spent)
+
+
+async def test_entry_price_includes_slippage(config):
+    """Цена входа в логе — средняя цена исполнения, а не котировка."""
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    analysis = await pipeline.process(fresh_token())
+    assert analysis is not None
+
+    spot = analysis.curve.spot_price
+    buy = next(r for r in read_log(config.logging.path) if r["type"] == "buy")
+    assert buy["entry_price"] > spot
+    assert buy["metrics"]["round_trip_cost_pct"] > 0
+    assert buy["metrics"]["curve_liquidity_sol"] == pytest.approx(15.0)

@@ -202,7 +202,7 @@ async def test_watcher_sells_only_dumped_positions(manager):
     async def price_fn(mint: str) -> float:
         return prices[mint]
 
-    async def sell_fn(pos, price, reason) -> None:
+    async def sell_fn(pos, price, reason, fraction=1.0) -> None:
         sold.append((pos.mint, reason))
         manager.register_close(pos.mint, pnl_sol=-0.25)
 
@@ -218,7 +218,7 @@ async def test_watcher_survives_price_errors(manager):
     async def price_fn(mint: str) -> float:
         raise RuntimeError("RPC лёг")
 
-    async def sell_fn(pos, price, reason) -> None:  # pragma: no cover - не должен вызваться
+    async def sell_fn(pos, price, reason, fraction=1.0) -> None:  # pragma: no cover
         raise AssertionError("продажа без цены")
 
     watcher = PositionWatcher(manager, price_fn, sell_fn)
@@ -324,7 +324,7 @@ async def test_watcher_tracks_peak_and_persists(config, tmp_path):
     async def price_fn(mint: str) -> float:
         return next(prices)
 
-    async def sell_fn(pos, price, reason) -> None:  # pragma: no cover
+    async def sell_fn(pos, price, reason, fraction=1.0) -> None:  # pragma: no cover
         raise AssertionError("выхода быть не должно")
 
     watcher = PositionWatcher(manager, price_fn, sell_fn)
@@ -345,7 +345,7 @@ async def test_watcher_reports_exit_reason(config):
     async def price_fn(mint: str) -> float:
         return 1.6
 
-    async def sell_fn(pos, price, reason) -> None:
+    async def sell_fn(pos, price, reason, fraction=1.0) -> None:
         seen.append(reason)
         manager.register_close(pos.mint, pnl_sol=0.3)
 
@@ -363,7 +363,7 @@ async def test_position_without_price_is_reported_blind(manager):
     async def price_fn(mint: str) -> float:
         raise RuntimeError("провайдер лёг")
 
-    async def sell_fn(pos, price, reason) -> None:  # pragma: no cover
+    async def sell_fn(pos, price, reason, fraction=1.0) -> None:  # pragma: no cover
         raise AssertionError("продажа без цены")
 
     watcher = PositionWatcher(manager, price_fn, sell_fn)
@@ -381,7 +381,7 @@ async def test_zero_price_counts_as_missing(manager):
     async def price_fn(mint: str) -> float:
         return 0.0
 
-    async def sell_fn(pos, price, reason) -> None:  # pragma: no cover
+    async def sell_fn(pos, price, reason, fraction=1.0) -> None:  # pragma: no cover
         raise AssertionError("продажа по нулевой цене")
 
     watcher = PositionWatcher(manager, price_fn, sell_fn)
@@ -397,7 +397,7 @@ async def test_recovered_price_clears_blindness(manager):
     async def price_fn(mint: str) -> float:
         return prices.pop(0)
 
-    async def sell_fn(pos, price, reason) -> None:  # pragma: no cover
+    async def sell_fn(pos, price, reason, fraction=1.0) -> None:  # pragma: no cover
         raise AssertionError("выхода быть не должно")
 
     watcher = PositionWatcher(manager, price_fn, sell_fn)
@@ -413,7 +413,7 @@ async def test_closed_position_is_not_blind(manager):
     async def price_fn(mint: str) -> float:
         return 0.0
 
-    async def sell_fn(pos, price, reason) -> None:  # pragma: no cover
+    async def sell_fn(pos, price, reason, fraction=1.0) -> None:  # pragma: no cover
         raise AssertionError("не должно вызваться")
 
     watcher = PositionWatcher(manager, price_fn, sell_fn)
@@ -421,3 +421,78 @@ async def test_closed_position_is_not_blind(manager):
         await watcher.check_once()
     manager.register_close("A", pnl_sol=0.0)
     assert watcher.blind == []
+
+
+# --- частичная фиксация ---------------------------------------------------
+
+
+def test_take_profit_can_be_partial(exits):
+    exits.take_profit_fraction = 0.6
+    signal = exit_signal(position(entry=1.0, opened_at=1000.0), 2.5, exits, now=1100.0)
+    assert signal.reason == "take_profit"
+    assert signal.fraction == pytest.approx(0.6)
+
+
+def test_take_profit_fires_only_once(exits):
+    """Иначе позиция распродавалась бы по кусочку на каждом тике."""
+    exits.take_profit_fraction = 0.6
+    pos = position(entry=1.0, opened_at=1000.0)
+    pos.partials = 1
+    assert exit_signal(pos, 2.5, exits, now=1100.0) is None
+
+
+def test_tail_after_partial_still_trails(exits):
+    exits.take_profit_fraction = 0.6
+    pos = position(entry=1.0, peak=3.0, opened_at=1000.0)
+    pos.partials = 1
+    signal = exit_signal(pos, 1.8, exits, now=1100.0)      # откат 40% от пика
+    assert signal is not None and signal.reason == "trailing_stop"
+    assert signal.fraction == 1.0                          # хвост продаётся целиком
+
+
+def test_protective_rules_are_never_partial(exits):
+    exits.take_profit_fraction = 0.5
+    pos = position(entry=1.0, opened_at=1000.0)
+    assert exit_signal(pos, 0.5, exits, now=1100.0).fraction == 1.0
+    assert exit_signal(pos, 1.0, exits, now=10**9).fraction == 1.0
+
+
+def test_full_take_profit_by_default(exits):
+    exits.take_profit_fraction = 1.0
+    assert exit_signal(position(entry=1.0), 2.5, exits, now=1.0).fraction == 1.0
+
+
+async def test_watcher_keeps_position_after_partial(config):
+    manager = RiskManager(config, clock=FakeClock())
+    manager.risk.take_profit_pct = 50.0
+    manager.risk.take_profit_fraction = 0.6
+    manager.register_open(position("A", entry=1.0))
+    calls: list[tuple[str, float]] = []
+
+    async def price_fn(mint: str) -> float:
+        return 1.6
+
+    async def sell_fn(pos, price, reason, fraction) -> None:
+        calls.append((reason, fraction))
+        pos.partials += 1                    # как это делает пайплайн
+
+    watcher = PositionWatcher(manager, price_fn, sell_fn)
+    assert await watcher.check_once() == []   # позиция закрыта не полностью
+    assert calls == [("take_profit", 0.6)]
+    assert "A" in manager.positions
+
+    assert await watcher.check_once() == []   # второй раз take-profit молчит
+    assert len(calls) == 1
+
+
+def test_partial_registers_money_but_keeps_position(config, tmp_path):
+    from src.state import StateStore
+
+    store = StateStore(tmp_path / "state.json")
+    manager = RiskManager(config, clock=FakeClock(), store=store)
+    manager.register_open(position("A"))
+    manager.register_partial("A", pnl_sol=0.3)
+
+    assert manager.realized_pnl_sol == pytest.approx(0.3)
+    assert "A" in manager.positions
+    assert store.load().realized_pnl_sol == pytest.approx(0.3)

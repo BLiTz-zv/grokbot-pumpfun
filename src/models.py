@@ -18,6 +18,8 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
+from .curve import CurveState
+
 # --------------------------------------------------------------------------
 # Токен и метрики
 # --------------------------------------------------------------------------
@@ -98,6 +100,8 @@ class TokenMetrics(BaseModel):
     buy_sell_ratio: float = 0.0
     unique_wallets: int = 0
     trade_count: int = 0
+    curve_liquidity_sol: float = 0.0     # реальных SOL в кривой
+    round_trip_cost_pct: float = 0.0     # во что обойдётся вход и выход
     risk_score: float = 10.0             # 0..10, чем выше, тем хуже
 
     @property
@@ -233,6 +237,7 @@ class Analysis(BaseModel):
 
     token: Token
     metrics: TokenMetrics = Field(default_factory=TokenMetrics)
+    curve: CurveState | None = None   # состояние кривой на момент разбора
     audit: AuditResult | None = None
     narrative: NarrativeResult | None = None
     timing: TimingResult | None = None
@@ -253,6 +258,8 @@ class Position(BaseModel):
     opened_at: float = 0.0
     tx_hash: str = ""
     score: float = 0.0
+    realized_sol: float = 0.0        # выручка уже закрытых частей позиции
+    partials: int = 0                # сколько раз выходили частично
 
 
 class TradeDecision(BaseModel):
@@ -315,6 +322,15 @@ class DataConfig(SecretModel):
         return self.api_key.get_secret_value()
 
 
+class MarketConfig(BaseModel):
+    """Микроструктура: во что обходится сделка и какую кривую вообще трогать."""
+
+    trade_fee_pct: float = 1.0            # комиссия площадки с каждой сделки
+    max_price_impact_pct: float = 3.0     # потолок влияния своей заявки на цену
+    min_curve_liquidity_sol: float = 3.0  # тоньше — выходить будет некуда
+    max_round_trip_cost_pct: float = 5.0  # вход плюс выход дороже этого — мимо
+
+
 class RiskConfig(BaseModel):
     max_sol_per_trade: float = 0.5
     daily_loss_limit_sol: float = 2.0
@@ -324,6 +340,7 @@ class RiskConfig(BaseModel):
     stop_loss_poll_seconds: float = 15.0
     # Выходы вверх и по времени. 0 в любом из них выключает правило.
     take_profit_pct: float = 120.0
+    take_profit_fraction: float = 0.6     # какую долю продать на take-profit
     trailing_stop_pct: float = 35.0       # откат от пика, считается только выше входа
     max_hold_seconds: float = 3600.0      # мемкоин, который час не поехал, не поедет
 
@@ -458,6 +475,7 @@ class Config(BaseModel):
     data: DataConfig = Field(default_factory=DataConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     filter: FilterConfig = Field(default_factory=FilterConfig)
+    market: MarketConfig = Field(default_factory=MarketConfig)
     scoring: ScoringConfig = Field(default_factory=ScoringConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
@@ -525,6 +543,8 @@ class Config(BaseModel):
             errors.append("risk.stop_loss_poll_seconds должен быть больше нуля")
         if risk.take_profit_pct < 0:
             errors.append("risk.take_profit_pct не может быть отрицательным")
+        if not 0 < risk.take_profit_fraction <= 1:
+            errors.append("risk.take_profit_fraction должен быть в интервале (0, 1]")
         if not 0 <= risk.trailing_stop_pct < 100:
             errors.append("risk.trailing_stop_pct должен быть в интервале [0, 100)")
         if risk.max_hold_seconds < 0:
@@ -549,6 +569,26 @@ class Config(BaseModel):
             errors.append("filter.rug_loss_pct должен быть в интервале (0, 100]")
         if flt.block_creator_after_rugs < 0:
             errors.append("filter.block_creator_after_rugs не может быть отрицательным")
+
+        market = self.market
+        if not 0 <= market.trade_fee_pct < 100:
+            errors.append("market.trade_fee_pct должен быть в интервале [0, 100)")
+        if market.max_price_impact_pct <= 0:
+            errors.append("market.max_price_impact_pct должен быть больше нуля")
+        if market.max_price_impact_pct <= market.trade_fee_pct:
+            errors.append(
+                f"market.max_price_impact_pct ({market.max_price_impact_pct}) не больше "
+                f"комиссии ({market.trade_fee_pct}): одна комиссия уже выбирает весь "
+                "допуск, и ни одна заявка не пройдёт"
+            )
+        if market.min_curve_liquidity_sol < 0:
+            errors.append("market.min_curve_liquidity_sol не может быть отрицательным")
+        if market.max_round_trip_cost_pct <= market.trade_fee_pct * 2:
+            warnings.append(
+                f"market.max_round_trip_cost_pct ({market.max_round_trip_cost_pct}) "
+                f"не больше двух комиссий ({market.trade_fee_pct * 2}) — "
+                "при таком пороге не пройдёт ни одна сделка"
+            )
 
         weights = self.scoring.weights
         if sum(max(0.0, w) for w in weights.model_dump().values()) <= 0:

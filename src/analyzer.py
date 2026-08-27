@@ -16,7 +16,8 @@ from typing import Any
 
 import httpx
 
-from .models import Config, Holder, Token, TokenMetrics, Trade
+from .curve import CurveState, round_trip_cost_pct, state_from_any
+from .models import Config, Holder, MarketConfig, Token, TokenMetrics, Trade
 
 log = logging.getLogger(__name__)
 
@@ -95,12 +96,23 @@ class Analyzer:
         """Полный проход: сходить в сеть и посчитать метрики."""
         info, holders, trades = await self.fetch(token.mint)
         enrich_token(token, info)
-        return compute_metrics(token, holders, trades)
+        curve = state_from_any(info, token.market_cap_sol)
+        return compute_metrics(
+            token, holders, trades, curve, self.config.market,
+            planned_sol=self.config.risk.max_sol_per_trade,
+        )
 
     def passes(self, metrics: TokenMetrics) -> tuple[bool, str]:
-        """Отсечка по риск-скору. Возвращает (прошёл, причина)."""
+        """Отсечка по риск-скору и торгуемости. Возвращает (прошёл, причина)."""
+        market = self.config.market
         if metrics.trade_count == 0:
             return False, "no_trade_data"
+        if metrics.curve_liquidity_sol < market.min_curve_liquidity_sol:
+            # Из тонкой кривой не выйти: своя же продажа обвалит цену.
+            return False, "curve_too_thin"
+        if (metrics.round_trip_cost_pct
+                and metrics.round_trip_cost_pct > market.max_round_trip_cost_pct):
+            return False, "round_trip_too_expensive"
         if metrics.risk_score > self.config.filter.max_risk_score:
             return False, "risk_score_too_high"
         return True, "ok"
@@ -165,8 +177,20 @@ def enrich_token(token: Token, info: dict[str, Any]) -> Token:
 # --------------------------------------------------------------------------
 
 
-def compute_metrics(token: Token, holders: list[Holder], trades: list[Trade]) -> TokenMetrics:
-    """Свести сырьё в метрики и риск-скор 0..10."""
+def compute_metrics(
+    token: Token,
+    holders: list[Holder],
+    trades: list[Trade],
+    curve: CurveState | None = None,
+    market: MarketConfig | None = None,
+    planned_sol: float = 0.0,
+) -> TokenMetrics:
+    """Свести сырьё в метрики и риск-скор 0..10.
+
+    Если известно состояние кривой, сюда же попадает стоимость входа и
+    выхода: на тонкой кривой она съедает движение, ради которого сделка
+    затевалась, и это надо видеть до решения, а не после.
+    """
     buys = [t for t in trades if t.is_buy]
     sells = [t for t in trades if not t.is_buy]
     wallets = {t.wallet for t in trades if t.wallet}
@@ -202,7 +226,16 @@ def compute_metrics(token: Token, holders: list[Holder], trades: list[Trade]) ->
         log.info("%s отсечён безусловно: %s", token.mint[:8], veto)
         risk = 10.0
 
+    liquidity = curve.real_sol if curve else 0.0
+    cost = (
+        round_trip_cost_pct(curve, planned_sol, (market or MarketConfig()).trade_fee_pct)
+        if curve and planned_sol > 0
+        else 0.0
+    )
+
     return TokenMetrics(
+        curve_liquidity_sol=round(liquidity, 4),
+        round_trip_cost_pct=round(cost, 4),
         top5_share=round(min(1.0, top5_share), 4),
         creator_share=round(min(1.0, creator_share), 4),
         sniper_count=sniper_count,

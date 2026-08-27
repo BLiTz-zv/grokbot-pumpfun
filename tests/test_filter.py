@@ -104,13 +104,26 @@ def test_parse_create_event():
             "symbol": "CAT",
             "image": "https://img",
             "traderPublicKey": "Creator1",
-            "vSolInBondingCurve": 8.5,
+            "vSolInBondingCurve": 38.5,
             "marketCapSol": 30.0,
         }
     )
     assert token is not None
     assert token.mint == "Abc"
+    # 30 SOL в резерве виртуальные: реально собрано 8.5
     assert token.curve_progress == pytest.approx(8.5 / CURVE_COMPLETION_SOL)
+
+
+def test_fresh_launch_has_zero_progress():
+    """Резерв новорождённой кривой — 30 виртуальных SOL. Если считать их
+    прогрессом, каждый лонч рождается с 35% и фильтр по кривой становится
+    в разы строже задуманного."""
+    token = parse_create_event({
+        "txType": "create", "mint": "New", "name": "n", "image": "i",
+        "vSolInBondingCurve": 30.0,
+    })
+    assert token is not None
+    assert token.curve_progress == 0.0
 
 
 def test_parse_ignores_trades():
