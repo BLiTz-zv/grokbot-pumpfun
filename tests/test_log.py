@@ -71,6 +71,7 @@ def test_close_record_computes_pnl_percent(trade_log):
     record = trade_log.close(position(), exit_price=0.7e-7, pnl_sol=-0.12, reason="stop_loss")
     assert record["pnl_pct"] == pytest.approx(-30.0)
     assert record["hold_seconds"] > 0
+    assert record["fee_sol"] == 0.0
 
 
 def test_broken_line_is_skipped_not_fatal(tmp_path):

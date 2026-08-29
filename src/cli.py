@@ -32,6 +32,7 @@ from .models import Config, ConfigError
 from .pipeline import amain as run_pipeline
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
+COMMANDS = frozenset({"run", "check", "doctor", "replay", "dashboard", "tune", "curve"})
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -115,8 +116,9 @@ def cmd_curve() -> int:
     print(f"    вход и выход 0.5 SOL стоят   {numbers['round_trip_0.5_sol']:.2f} %")
     print(f"    потолок заявки при 3%        {numbers['max_sol_for_3pct']:.3f} SOL")
     print(f"    за 1 SOL дают токенов        {numbers['tokens_for_1_sol']:,.0f}")
-    print("\n  Константы взяты из программы pump.fun и могут устареть:")
-    print("  перед включением live сверьте их с ончейном.\n")
+    print("\n  Константы взяты из программы pump.fun и могут устареть.")
+    print("  Бумажный стол считает по ним; перед любой своей доработкой")
+    print("  исполнения сверьте их с ончейном.\n")
     return 0
 
 
@@ -125,15 +127,38 @@ def run_script(name: str, args: list[str]) -> int:
     script = SCRIPTS / f"{name}.py"
     if not script.exists():
         raise SystemExit(f"Скрипт {script} не найден")
+    previous = sys.argv
     sys.argv = [str(script), *args]
     try:
         runpy.run_path(str(script), run_name="__main__")
     except SystemExit as exc:
         return int(exc.code or 0)
+    finally:
+        sys.argv = previous
     return 0
 
 
+def _looks_like_pipeline_argv(argv: list[str]) -> bool:
+    """Старый вызов без подкоманды: `python -m src.cli --config x --check`.
+
+    Docker CI и unit-файлы ходили в pipeline так. После переезда на
+    `grokbot <команда>` это должно продолжать значить то же самое, а не
+    падать на argparse — иначе проверка плейсхолдеров в образе зелёная
+    по неправильной причине.
+    """
+    if not argv:
+        return False
+    if any(arg in COMMANDS for arg in argv if not arg.startswith("-")):
+        return False
+    flags = {"--check", "--config", "--i-understand-the-risk"}
+    return any(arg in flags or arg.startswith("--config=") for arg in argv)
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if _looks_like_pipeline_argv(argv):
+        return asyncio.run(run_pipeline(argv))
+
     args = build_parser().parse_args(argv)
     command = args.command or "run"
 

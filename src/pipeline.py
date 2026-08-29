@@ -35,7 +35,7 @@ from .agents import AuditorAgent, CheckerAgent, NarrativeAgent, TimingAgent
 from .alerts import Notifier
 from .analyzer import Analyzer, compute_metrics, enrich_token
 from .curve import max_sol_for_impact, state_from_any
-from .executor import BaseExecutor, build_executor, new_position
+from .executor import BaseExecutor, build_executor, live_execution_is_stub, new_position
 from .log import TradeLog, read_log, setup_logging
 from .market import MarketPulse
 from .models import Analysis, Config, ConfigError, Position, Token
@@ -156,9 +156,15 @@ class Pipeline:
         if seeded:
             log.info("в память рынка поднято %d прошлых исходов", seeded)
         for mint in unmatched_intents(records):
-            log.error("на диске осталось намерение купить %s без записи о покупке — "
-                      "возможно, процесс умер во время исполнения. Проверьте кошелёк: "
-                      "позиция может существовать, а бот о ней не знает", mint[:8])
+            if self.config.is_live:
+                log.error("на диске осталось намерение купить %s без записи о покупке — "
+                          "возможно, процесс умер во время исполнения. Проверьте кошелёк: "
+                          "позиция может существовать, а бот о ней не знает", mint[:8])
+            else:
+                log.error("на диске осталось намерение купить %s без записи о покупке — "
+                          "процесс, похоже, умер во время dry-run исполнения. "
+                          "Реальной позиции на кошельке нет: это бумажный стол. "
+                          "Запись в логе — след сбоя, а не ончейн-сделка", mint[:8])
             self.notifier.notify(
                 "stalled", f"незакрытое намерение купить {mint[:8]} после рестарта",
                 mint=mint,
@@ -357,7 +363,8 @@ class Pipeline:
         self.reputation.record_open(token.creator)
         self.trade_log.buy(analysis, size_sol=decision.size_sol,
                            entry_price=result.price, tx_hash=result.tx_hash,
-                           prompt_versions=self.prompt_versions())
+                           prompt_versions=self.prompt_versions(),
+                           fee_sol=result.fee_sol, impact_pct=result.impact_pct)
         self.metrics.inc("buys")
         self.pulse.record_bought()
         self.metrics.gauge("open_positions", self.risk.open_count)
@@ -548,12 +555,22 @@ class Pipeline:
             self.metrics.inc("sell_not_implemented")
             return
 
+        if not result.ok:
+            # Не закрываем по споту: это та самая «прибыль по котировке»,
+            # которой на кривой нет. Позиция остаётся, следующий проход
+            # попробует снова.
+            log.error("продажа %s не исполнена (%s) — позиция остаётся открытой, "
+                      "PnL по споту не записываем",
+                      position.mint[:8], result.error)
+            self.metrics.inc("sell_failed")
+            return
+
         tokens_before = position.token_amount or 1.0
-        sold = result.token_amount if result.ok else tokens_before * fraction
+        sold = result.token_amount
         share = max(0.0, min(1.0, sold / tokens_before))
         final = share >= 0.999
 
-        proceeds = result.sol_amount if result.ok else sold * price
+        proceeds = result.sol_amount
         cost_basis = position.sol_spent * share
         pnl = proceeds - cost_basis
         exit_price = result.price or price
@@ -582,7 +599,8 @@ class Pipeline:
                      position.mint[:8], share * 100, position.sol_spent)
 
         self.trade_log.close(position, exit_price=exit_price, pnl_sol=pnl, reason=reason,
-                             tx_hash=result.tx_hash, fraction=share, final=final)
+                             tx_hash=result.tx_hash, fraction=share, final=final,
+                             fee_sol=result.fee_sol, impact_pct=result.impact_pct)
         self.metrics.inc("closes" if final else "partial_closes")
         self.metrics.inc(f"exit_{reason}")
         self.metrics.gauge("open_positions", self.risk.open_count)
@@ -615,12 +633,14 @@ LIVE_WARNING = """
 ================================================================
   РЕЖИМ LIVE
 
-  Пайплайн будет отправлять РЕАЛЬНЫЕ транзакции реальным кошельком
-  из config.yaml. Мемкоины на бондинговой кривой теряют стоимость
-  полностью и обычно. Потолок на сделку {max_sol} SOL, дневной лимит
-  убытка {daily} SOL — это ограничители, а не гарантия.
+  В этом репозитории LiveExecutor — заглушка по замыслу: код не
+  подписывает транзакции и не отправляет их в сеть. Включать live
+  здесь бессмысленно — агенты потратят токены Grok, а покупок не
+  будет. Бумажный стол работает в mode: dry-run.
 
-  Запуск в live требует флага --i-understand-the-risk.
+  Если исполнение когда-нибудь допишут отдельно, запуск в live
+  потребует флага --i-understand-the-risk. Потолок на сделку
+  {max_sol} SOL, дневной лимит убытка {daily} SOL.
 ================================================================
 """
 
@@ -659,6 +679,12 @@ def load_and_check(args: argparse.Namespace) -> Config:
             max_sol=config.risk.max_sol_per_trade,
             daily=config.risk.daily_loss_limit_sol,
         ), file=sys.stderr)
+        if live_execution_is_stub():
+            raise SystemExit(
+                "Отказ: LiveExecutor — заглушка по замыслу, реальных сделок не будет. "
+                "Бумажный стол работает в mode: dry-run. Не включайте live, "
+                "пока не допишете отправку транзакций сами."
+            )
         if not getattr(args, "i_understand_the_risk", False):
             raise SystemExit(
                 "Отказ: mode: live без флага --i-understand-the-risk. "

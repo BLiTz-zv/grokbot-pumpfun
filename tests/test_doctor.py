@@ -210,7 +210,9 @@ async def test_socket_failure_fails(config, monkeypatch):
 
 
 def test_dry_run_mode_is_ok(config):
-    assert check_live_readiness(config)[0].status == OK
+    checks = check_live_readiness(config)
+    assert checks[0].status == OK
+    assert "dry-run" in checks[0].detail
 
 
 def test_live_mode_flags_the_stub(config):

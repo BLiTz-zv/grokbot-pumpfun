@@ -128,25 +128,49 @@ class InstanceLock:
         return True
 
     def acquire(self) -> bool:
-        """Занять замок. False, если его держит живой процесс."""
+        """Занять замок. False, если его держит живой процесс.
+
+        Пишем через O_EXCL: два процесса, одновременно увидевшие пустой
+        файл, не должны оба решить, что замок их.
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        pid = self._holder()
-        if pid and pid != os.getpid() and self._alive(pid):
-            log.error("состояние %s уже занято процессом %d — второй бот на том "
-                      "же кошельке не запускается", self.path.stem, pid)
-            return False
-        if pid and not self._alive(pid):
-            log.warning("замок остался от мёртвого процесса %d, перехватываем", pid)
-        try:
-            self.path.write_text(
-                json.dumps({"pid": os.getpid(), "started": time.time()}),
-                encoding="utf-8",
-            )
-        except OSError as exc:
-            log.error("не удалось занять замок %s: %s", self.path, exc)
-            return False
-        self.acquired = True
-        return True
+        for _ in range(5):
+            pid = self._holder()
+            if pid and pid != os.getpid() and self._alive(pid):
+                log.error("состояние %s уже занято процессом %d — второй бот на том "
+                          "же кошельке не запускается", self.path.stem, pid)
+                return False
+            if self.path.exists():
+                if pid and not self._alive(pid):
+                    log.warning("замок остался от мёртвого процесса %d, перехватываем", pid)
+                elif pid == os.getpid():
+                    self.acquired = True
+                    return True
+                with contextlib.suppress(OSError):
+                    self.path.unlink()
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                log.error("не удалось занять замок %s: %s", self.path, exc)
+                return False
+            try:
+                os.write(
+                    fd,
+                    json.dumps({"pid": os.getpid(), "started": time.time()}).encode(),
+                )
+            except OSError as exc:
+                log.error("не удалось занять замок %s: %s", self.path, exc)
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                    self.path.unlink()
+                return False
+            os.close(fd)
+            self.acquired = True
+            return True
+        log.error("не удалось занять замок %s: гонка с другим процессом", self.path)
+        return False
 
     def release(self) -> None:
         if not self.acquired:

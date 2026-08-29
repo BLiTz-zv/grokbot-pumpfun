@@ -41,6 +41,7 @@ __all__ = [
     "ExecutionResult",
     "LiveExecutor",
     "build_executor",
+    "live_execution_is_stub",
     "new_position",
     "price_from_reserves",
 ]
@@ -256,6 +257,21 @@ class LiveExecutor(BaseExecutor):
             "LiveExecutor.sell не реализован намеренно: допишите отправку "
             "транзакций сами, прежде чем включать mode: live"
         )
+
+
+def live_execution_is_stub() -> bool:
+    """True, пока LiveExecutor.buy/sell поднимают NotImplementedError по замыслу.
+
+    И doctor, и запуск пайплайна смотрят сюда: live нельзя считать готовым,
+    пока в этом модуле нет настоящей отправки. Ищем фразу из исключения,
+    а не «есть ли TODO в комментарии» — комментарий можно оставить, а
+    заглушку убрать, и наоборот.
+    """
+    try:
+        consts = LiveExecutor.buy.__code__.co_consts + LiveExecutor.sell.__code__.co_consts
+    except AttributeError:  # pragma: no cover
+        return True
+    return any(isinstance(c, str) and "не реализован намеренно" in c for c in consts)
 
 
 def build_executor(config: Config, client: httpx.AsyncClient | None = None) -> BaseExecutor:

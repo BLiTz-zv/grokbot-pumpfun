@@ -118,6 +118,8 @@ class TradeLog:
         entry_price: float,
         tx_hash: str,
         prompt_versions: dict[str, str] | None = None,
+        fee_sol: float = 0.0,
+        impact_pct: float = 0.0,
     ) -> dict[str, Any]:
         token = analysis.token
         return self._write(
@@ -128,6 +130,8 @@ class TradeLog:
                 "name": token.name,
                 "size_sol": round(size_sol, 6),
                 "entry_price": entry_price,
+                "fee_sol": round(fee_sol, 6),
+                "impact_pct": round(impact_pct, 4),
                 "tx_hash": tx_hash,
                 "scores": analysis.scores.model_dump(),
                 "audit": analysis.audit.model_dump() if analysis.audit else None,
@@ -193,6 +197,8 @@ class TradeLog:
         tx_hash: str = "",
         fraction: float = 1.0,
         final: bool = True,
+        fee_sol: float = 0.0,
+        impact_pct: float = 0.0,
     ) -> dict[str, Any]:
         held = max(0.0, time.time() - position.opened_at) if position.opened_at else 0.0
         pnl_pct = (
@@ -210,6 +216,8 @@ class TradeLog:
                 "exit_price": exit_price,
                 "pnl_sol": round(pnl_sol, 6),
                 "pnl_pct": round(pnl_pct, 2),
+                "fee_sol": round(fee_sol, 6),
+                "impact_pct": round(impact_pct, 4),
                 "hold_seconds": round(held, 1),
                 "reason": reason,
                 "fraction": round(fraction, 4),

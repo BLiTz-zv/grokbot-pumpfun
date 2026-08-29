@@ -43,7 +43,7 @@ doctor:          ## предполётная проверка окружения
 curve:           ## во что обходится сделка на кривой
 	$(BIN)/python -m src.cli curve
 
-run:             ## запустить пайплайн (режим берётся из конфига)
+run:             ## запустить бумажный стол (dry-run)
 	$(BIN)/python -m src.cli run --config $(CONFIG)
 
 dashboard:       ## живой дашборд по логу

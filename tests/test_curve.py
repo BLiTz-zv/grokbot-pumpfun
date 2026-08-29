@@ -143,6 +143,29 @@ def test_state_from_api_rejects_junk():
     assert CurveState.from_api({"virtual_sol_reserves": "нет", "virtual_token_reserves": 1}) is None
 
 
+def test_state_from_api_accepts_camel_case():
+    """Провайдер иногда отдаёт camelCase. Если его не читать, dry-run
+    откатывается к капитализации и врёт в цене."""
+    snake = CurveState.from_api({
+        "virtual_sol_reserves": 45_000_000_000,
+        "virtual_token_reserves": 715_333_460_666_667,
+    })
+    camel = CurveState.from_api({
+        "virtualSolReserves": 45_000_000_000,
+        "virtualTokenReserves": 715_333_460_666_667,
+    })
+    assert snake is not None and camel is not None
+    assert camel.sol_reserves == pytest.approx(snake.sol_reserves)
+    assert camel.token_reserves == pytest.approx(snake.token_reserves)
+
+
+def test_usd_market_cap_is_not_treated_as_sol():
+    """usd_market_cap — доллары. Подставить их как SOL — завысить цену
+    в сотню раз и посчитать прибыль, которой нет."""
+    assert price_from_reserves({"usd_market_cap": 45_000.0}) == 0.0
+    assert price_from_reserves({"marketCapSol": 60.0}) == pytest.approx(60.0 / TOTAL_SUPPLY)
+
+
 def test_state_from_any_falls_back_to_market_cap():
     state = state_from_any({}, market_cap_sol=60.0)
     assert state is not None

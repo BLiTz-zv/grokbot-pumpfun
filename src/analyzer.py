@@ -165,10 +165,12 @@ def enrich_token(token: Token, info: dict[str, Any]) -> Token:
     token.telegram = token.telegram or info.get("telegram")
     token.website = token.website or info.get("website")
     token.creator = token.creator or info.get("creator")
-    if info.get("market_cap") is not None:
-        token.market_cap_sol = float(info["market_cap"])
-    if info.get("virtual_sol_reserves") is not None:
-        token.sol_in_curve = float(info["virtual_sol_reserves"]) / 1e9
+    cap = info.get("market_cap_sol") or info.get("marketCapSol") or info.get("market_cap")
+    if cap is not None:
+        token.market_cap_sol = float(cap)
+    sol_raw = info.get("virtual_sol_reserves") or info.get("virtualSolReserves")
+    if sol_raw is not None:
+        token.sol_in_curve = float(sol_raw) / 1e9
     return token
 
 
