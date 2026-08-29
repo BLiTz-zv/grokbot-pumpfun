@@ -243,20 +243,14 @@ async def check_rpc(config: Config, client: httpx.AsyncClient | None = None) -> 
 
 def check_live_readiness(config: Config) -> list[Check]:
     if not config.is_live:
-        return [Check("режим", OK, "dry-run: транзакции не отправляются")]
-    from .executor import LiveExecutor
+        return [Check("режим", OK, "dry-run: бумажный стол, транзакции не отправляются")]
+    from .executor import live_execution_is_stub
 
-    checks = [Check("режим", WARN, "live: транзакции будут отправлены по-настоящему")]
-    stub = "не реализован намеренно" in (LiveExecutor.buy.__doc__ or "")
-    try:
-        source = LiveExecutor.buy.__code__.co_consts
-        stub = stub or any("не реализован намеренно" in c for c in source if isinstance(c, str))
-    except AttributeError:      # pragma: no cover
-        pass
-    if stub:
+    checks = [Check("режим", WARN, "live выбран, но в этом репозитории исполнение — заглушка")]
+    if live_execution_is_stub():
         checks.append(Check(
             "исполнение", FAIL, "LiveExecutor всё ещё заглушка",
-            "допишите отправку транзакций либо верните mode: dry-run",
+            "этот репозиторий — бумажный стол; верните mode: dry-run",
         ))
     return checks
 
@@ -291,10 +285,12 @@ async def run_checks(config: Config, skip_network: bool = False) -> Report:
         report.add(Check("сеть", WARN, "проверки сети пропущены (--offline)"))
         return report
 
-    grok, data, rpc = await asyncio.gather(
-        check_grok(config), check_data_api(config), check_rpc(config)
-    )
-    report.add(grok, data, rpc)
+    network = [check_grok(config), check_data_api(config)]
+    if config.is_live:
+        network.append(check_rpc(config))
+    report.add(*(await asyncio.gather(*network)))
+    if not config.is_live:
+        report.add(Check("Solana RPC", OK, "пропущен: в dry-run не нужен"))
     report.add(await check_socket(config))
     return report
 

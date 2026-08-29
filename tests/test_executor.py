@@ -182,6 +182,12 @@ async def test_live_executor_is_a_deliberate_stub():
         await executor.sell(position())
 
 
+def test_live_execution_is_reported_as_stub():
+    from src.executor import live_execution_is_stub
+
+    assert live_execution_is_stub()
+
+
 async def test_live_executor_can_still_quote():
     """Расчёт заявки живой и в live: из него берутся max_sol_cost и
     min_sol_output, когда отправка будет дописана."""

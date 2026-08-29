@@ -54,7 +54,7 @@ jobs:
         run: docker build -t grokbot-pumpfun:ci .
       - name: Образ стартует и отвергает конфиг с плейсхолдерами
         run: |
-          if docker run --rm grokbot-pumpfun:ci --config /app/config.example.yaml --check; then
+          if docker run --rm grokbot-pumpfun:ci check --config /app/config.example.yaml; then
             echo "образ принял конфиг без ключей — так быть не должно"
             exit 1
           fi

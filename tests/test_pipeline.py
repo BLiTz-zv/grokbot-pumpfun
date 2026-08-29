@@ -162,6 +162,8 @@ async def test_dry_run_buys_and_logs_full_context(config):
     assert buy["narrative"] and buy["timing"] and buy["checker"]
     assert buy["metrics"]["trade_count"] == 30
     assert buy["entry_price"] > 0
+    assert buy["fee_sol"] > 0
+    assert buy["impact_pct"] > 0
 
 
 async def test_checker_veto_stops_the_buy(config):
@@ -323,7 +325,17 @@ async def test_metrics_count_stages(config):
 # --- защита режима live ---------------------------------------------------
 
 
-def test_live_without_flag_refuses(tmp_path):
+def test_live_is_refused_while_executor_is_a_stub(tmp_path):
+    """Бумажный стол: live с заглушкой не стартует даже с флагом риска."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(LIVE_YAML)
+    with pytest.raises(SystemExit) as exc:
+        load_and_check(parse_args(["--config", str(cfg), "--i-understand-the-risk"]))
+    assert "заглушка" in str(exc.value)
+
+
+def test_live_without_flag_refuses_once_executor_exists(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.pipeline.live_execution_is_stub", lambda: False)
     cfg = tmp_path / "config.yaml"
     cfg.write_text(LIVE_YAML)
     with pytest.raises(SystemExit) as exc:
@@ -331,7 +343,8 @@ def test_live_without_flag_refuses(tmp_path):
     assert "--i-understand-the-risk" in str(exc.value)
 
 
-def test_live_with_flag_allowed(tmp_path):
+def test_live_with_flag_allowed_once_executor_exists(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.pipeline.live_execution_is_stub", lambda: False)
     cfg = tmp_path / "config.yaml"
     cfg.write_text(LIVE_YAML)
     config = load_and_check(parse_args(["--config", str(cfg), "--i-understand-the-risk"]))
@@ -638,6 +651,30 @@ async def test_alerts_off_by_default(config):
 # --- покупка без цены -----------------------------------------------------
 
 
+async def test_failed_sell_does_not_invent_spot_pnl(config):
+    """Провалившаяся продажа не должна закрывать позицию по споту:
+    это та самая фантазия, которой на кривой нет."""
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    await pipeline.process(fresh_token())
+    position = pipeline.risk.positions["Mint1111"]
+    spent = position.sol_spent
+
+    empty = httpx.AsyncClient(
+        base_url="http://test",
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})),
+    )
+    pipeline.executor._client = empty
+
+    await pipeline._sell(position, price=position.entry_price * 2.0, reason="take_profit")
+
+    assert pipeline.risk.open_count == 1
+    assert pipeline.risk.positions["Mint1111"].sol_spent == pytest.approx(spent)
+    assert pipeline.risk.realized_pnl_sol == 0.0
+    assert pipeline.metrics.counters["sell_failed"] == 1
+    assert not any(r["type"] == "close" for r in read_log(config.logging.path))
+
+
 async def test_token_without_curve_data_is_refused(config):
     """Позиция с неизвестной ценой входа неуправляема: ни одно правило
     выхода на ней не срабатывает, и она висела бы открытой вечно."""
@@ -933,6 +970,7 @@ def test_orphan_intent_is_reported_on_restart(config, caplog):
     with caplog.at_level("ERROR"):
         pipeline.restore()
     assert "Осироте" in caplog.text
+    assert "кошелёк" not in caplog.text          # в dry-run кошелька нет
 
 
 async def test_completed_intent_is_not_reported(config, caplog):

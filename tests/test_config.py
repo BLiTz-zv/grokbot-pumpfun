@@ -107,6 +107,18 @@ def test_example_config_is_rejected_as_is():
         cfg.check_ready()
 
 
+def test_example_config_is_a_paper_desk():
+    from pathlib import Path
+
+    import yaml
+
+    raw = yaml.safe_load(Path("config.example.yaml").read_text())
+    assert raw["mode"] == "dry-run"
+    assert raw["solana"]["jito"]["enabled"] is False
+    assert raw["market"]["trade_fee_pct"] == 1.0
+    assert raw["market"]["max_price_impact_pct"] == 3.0
+
+
 def test_good_config_passes():
     assert isinstance(config().check_ready(), list)
 

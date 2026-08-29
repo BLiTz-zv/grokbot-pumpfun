@@ -97,17 +97,22 @@ class CurveState(BaseModel):
         """Резервы из ответа провайдера. None, если их там нет.
 
         Провайдеры отдают их в лампортах и в «сырых» единицах токена
-        (6 знаков), поэтому приводим к человеческим числам.
+        (6 знаков), поэтому приводим к человеческим числам. Имена полей
+        плавают между snake_case и camelCase — читаем оба.
         """
-        sol_raw = data.get("virtual_sol_reserves")
-        token_raw = data.get("virtual_token_reserves")
+        sol_raw = data.get("virtual_sol_reserves") or data.get("virtualSolReserves")
+        token_raw = data.get("virtual_token_reserves") or data.get("virtualTokenReserves")
         if not sol_raw or not token_raw:
             return None
         try:
             state = cls(
                 sol_reserves=float(sol_raw) / 1e9,
                 token_reserves=float(token_raw) / 1e6,
-                complete=bool(data.get("complete") or data.get("raydium_pool")),
+                complete=bool(
+                    data.get("complete")
+                    or data.get("raydium_pool")
+                    or data.get("raydiumPool")
+                ),
             )
         except (TypeError, ValueError):
             return None
@@ -266,21 +271,32 @@ def state_from_any(data: dict[str, Any], market_cap_sol: float = 0.0) -> CurveSt
         spot = market_cap_sol / TOTAL_SUPPLY
     restored = CurveState.from_spot_price(spot)
     if restored is not None:
-        restored.complete = bool(data.get("complete") or data.get("raydium_pool"))
+        restored.complete = bool(
+            data.get("complete") or data.get("raydium_pool") or data.get("raydiumPool")
+        )
     return restored
 
 
+def _market_cap_sol(data: dict[str, Any]) -> float:
+    """Капитализация в SOL. USD сюда не подставляем: это в ~сотню раз
+    завысило бы цену и превратило dry-run PnL в фантазию."""
+    raw = data.get("market_cap_sol") or data.get("marketCapSol") or data.get("market_cap")
+    if raw is None:
+        return 0.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def price_from_reserves(data: dict[str, Any]) -> float:
-    """Спотовая цена из ответа провайдера, с запасным вариантом по капитализации."""
+    """Спотовая цена из ответа провайдера, с запасным вариантом по капитализации в SOL."""
     state = CurveState.from_api(data)
     if state is not None:
         return state.spot_price
-    market_cap = data.get("market_cap") or data.get("usd_market_cap")
-    if market_cap:
-        try:
-            return float(market_cap) / TOTAL_SUPPLY
-        except (TypeError, ValueError):
-            return 0.0
+    cap = _market_cap_sol(data)
+    if cap > 0:
+        return cap / TOTAL_SUPPLY
     return 0.0
 
 

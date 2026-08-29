@@ -298,7 +298,7 @@ class GrokConfig(SecretModel):
 
 
 class JitoConfig(BaseModel):
-    enabled: bool = True
+    enabled: bool = False
     block_engine_url: str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles"
     tip_lamports: int = 1_000_000
 

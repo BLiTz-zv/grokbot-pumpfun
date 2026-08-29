@@ -136,5 +136,13 @@ def test_argv_restored_for_the_caller(tmp_path):
     log.write_text("")
     before = list(sys.argv)
     main(["replay", str(log)])
-    sys.argv = before
     assert sys.argv == before
+
+
+def test_legacy_check_flag_without_subcommand(config_file, capsys):
+    """`python -m src.cli --config x --check` ходил в pipeline до подкоманд.
+    Образ в CI так и проверяет плейсхолдеры — это должен быть check, а не
+    argparse-ошибка."""
+    assert main(["--config", str(config_file), "--check"]) == 0
+    printed = capsys.readouterr().out
+    assert json.loads(printed)["mode"] == "dry-run"

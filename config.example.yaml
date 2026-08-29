@@ -2,6 +2,7 @@
 #   cp config.example.yaml config.yaml
 # config.yaml лежит в .gitignore и в репозиторий не попадает.
 #
+# Это бумажный стол: mode по умолчанию dry-run, LiveExecutor — заглушка.
 # Секреты можно не класть в файл вообще — переменные окружения важнее его:
 #   GROKBOT_GROK_API_KEY, GROKBOT_DATA_API_KEY, GROKBOT_WALLET_PRIVATE_KEY,
 #   GROKBOT_MODE, GROKBOT_RPC_URL, GROKBOT_LOG_PATH, GROKBOT_LOG_LEVEL,
@@ -10,9 +11,10 @@
 #
 # Конфиг проверяется на старте. Бессмысленные значения (нулевой лимит,
 # порог вне диапазона, live без ключа кошелька) — отказ запуска, а не
-# сюрприз через час торговли.
+# сюрприз через час торговли. mode: live этот репозиторий всё равно
+# не примет, пока исполнение — заглушка.
 
-mode: dry-run            # dry-run | live
+mode: dry-run            # dry-run | live. Live здесь не работает: executor — stub.
 
 grok:
   api_key: "xai-YOUR-KEY-HERE"
@@ -25,17 +27,24 @@ grok:
 
 solana:
   rpc_url: "https://api.mainnet-beta.solana.com"
-  wallet_private_key: "YOUR-BASE58-PRIVATE-KEY"
+  wallet_private_key: "YOUR-BASE58-PRIVATE-KEY"   # в dry-run не используется
   jito:
-    enabled: true
+    enabled: false            # в этом репозитории бандлы не отправляются
     block_engine_url: "https://mainnet.block-engine.jito.wtf/api/v1/bundles"
-    tip_lamports: 1000000     # чаевые за приоритет
+    tip_lamports: 1000000     # чаевые за приоритет — только если допишете live
 
 data:
   api_key: "YOUR-DATA-PROVIDER-KEY"
   rest_url: "https://frontend-api.pump.fun"
   ws_url: "wss://pumpportal.fun/api/data"
   request_timeout: 10
+
+# Микроструктура кривой. Без этих чисел dry-run покупал бы по котировке.
+market:
+  trade_fee_pct: 1.0            # комиссия площадки с каждой стороны
+  max_price_impact_pct: 3.0     # потолок влияния своей заявки на цену
+  min_curve_liquidity_sol: 3.0  # тоньше — выходить будет некуда
+  max_round_trip_cost_pct: 5.0  # вход плюс выход дороже этого — мимо
 
 risk:
   max_sol_per_trade: 0.5        # потолок SOL на одну сделку
