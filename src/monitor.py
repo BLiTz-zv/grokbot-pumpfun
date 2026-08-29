@@ -127,11 +127,15 @@ class LaunchMonitor:
         self.pending: dict[str, Token] = {}
         self._buyers: dict[str, set[str]] = {}
         self._emitted = SeenSet()
+        # Любое сообщение из сокета, не только токен, переживший фильтр.
+        # Иначе 94% отсева на мониторе выглядит как застой потока.
+        self.last_message_at = 0.0
 
     # -- обработка событий -------------------------------------------------
 
     def handle_event(self, payload: dict[str, Any]) -> Token | None:
         """Одно сообщение из сокета. Возвращает токен, если он готов идти дальше."""
+        self.last_message_at = time.time()
         tx_type = payload.get("txType")
 
         if tx_type in ("create", "created"):

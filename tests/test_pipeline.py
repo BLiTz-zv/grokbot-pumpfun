@@ -314,6 +314,21 @@ async def test_status_degrades_when_stream_stalls(config):
     assert status["status"] == "degraded"
 
 
+async def test_monitor_traffic_is_not_a_stall(config):
+    """Отсев на мониторе — это живой поток, а не застой. Иначе бумажный
+    стол через десять минут тишины среди 94% skip помечался бы degraded."""
+    pipeline = Pipeline(config)
+    pipeline._last_event_at -= 10_000
+    pipeline.monitor.handle_event({
+        "txType": "create", "mint": "A", "name": "n", "image": "i",
+        "timestamp": time.time() * 1000,
+    })
+    status = pipeline.status()
+    assert not status["stalled"]
+    assert status["seconds_since_event"] < 2
+    assert status["status"] == "ok"
+
+
 async def test_metrics_count_stages(config):
     pipeline = Pipeline(config)
     wire(pipeline, REJECT)

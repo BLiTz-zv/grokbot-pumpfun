@@ -143,8 +143,10 @@ def make_monitor(skips: list) -> LaunchMonitor:
 def test_new_launch_is_buffered_not_emitted():
     skips: list = []
     mon = make_monitor(skips)
+    assert mon.last_message_at == 0.0
     assert mon.handle_event({"txType": "create", "mint": "A", "name": "n", "image": "i"}) is None
     assert "A" in mon.pending
+    assert mon.last_message_at > 0
 
 
 def test_token_emitted_once_it_matures():

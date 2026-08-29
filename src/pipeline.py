@@ -481,7 +481,8 @@ class Pipeline:
 
     def status(self) -> dict[str, Any]:
         """Снимок для /healthz и heartbeat. Ничего секретного не содержит."""
-        stalled = (time.time() - self._last_event_at) > STALL_SECONDS
+        last_event = max(self._last_event_at, self.monitor.last_message_at)
+        stalled = (time.time() - last_event) > STALL_SECONDS
         breaker = self.grok_ops.breaker.state
         blind = bool(self.watcher.blind)
         state = "degraded" if breaker == "open" or stalled or blind else "ok"
@@ -490,7 +491,7 @@ class Pipeline:
             "mode": self.config.mode,
             "uptime_seconds": round(self.metrics.uptime_seconds, 1),
             "stalled": stalled,
-            "seconds_since_event": round(time.time() - self._last_event_at, 1),
+            "seconds_since_event": round(time.time() - last_event, 1),
             "in_flight": len(self._tasks),
             "pending_launches": len(self.monitor.pending),
             "open_positions": self.risk.open_count,
